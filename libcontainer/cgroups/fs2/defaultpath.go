@@ -25,13 +25,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/utils"
 )
 
 const UnifiedMountpoint = "/sys/fs/cgroup"
 
-func defaultDirPath(c *configs.Cgroup) (string, error) {
+func defaultDirPath(c *cgroups.Cgroup) (string, error) {
 	if (c.Name != "" || c.Parent != "") && c.Path != "" {
 		return "", fmt.Errorf("cgroup: either Path or Name and Parent should be used, got %+v", c)
 	}
@@ -55,6 +55,9 @@ func _defaultDirPath(root, cgPath, cgParent, cgName string) (string, error) {
 		return filepath.Join(root, innerPath), nil
 	}
 
+	// we don't need to use /proc/thread-self here because runc always runs
+	// with every thread in the same cgroup. This lets us avoid having to do
+	// runtime.LockOSThread.
 	ownCgroup, err := parseCgroupFile("/proc/self/cgroup")
 	if err != nil {
 		return "", err

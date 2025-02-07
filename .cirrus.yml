@@ -1,7 +1,8 @@
 ---
-# We use Cirrus for Vagrant tests and native CentOS 7 and 8, because macOS
-# instances of GHA are too slow and flaky, and Linux instances of GHA do not
-# support KVM.
+# We use Cirrus for RHEL clones (native) and Fedora (in Vagrant), because
+# neither is available on GHA natively, so the only option is VM.
+# In GHA, nested virtualization is only supported on macOS instances, which
+# are slow and flaky.
 
 # NOTE Cirrus execution environments lack a terminal, needed for
 # some integration tests. So we use `ssh -tt` command to fake a terminal.
@@ -24,25 +25,31 @@ task:
     platform: linux
     nested_virtualization: true
     # CPU limit: `16 / NTASK`: see https://cirrus-ci.org/faq/#are-there-any-limits
-    cpu: 8
+    cpu: 4
     # Memory limit: `4GB * NCPU`
-    memory: 32G
+    memory: 16G
 
   host_info_script: |
     uname -a
-    echo "-----"
+    # -----
     cat /etc/os-release
-    echo "-----"
-    cat /proc/cpuinfo
-    echo "-----"
+    # -----
     df -T
+    # -----
+    cat /proc/cpuinfo
   install_libvirt_vagrant_script: |
+    curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+    sudo sed -i 's/^# deb-src/deb-src/' /etc/apt/sources.list
     apt-get update
-    apt-get install -y libvirt-daemon libvirt-daemon-system vagrant vagrant-libvirt
+    apt-get install -y libvirt-daemon libvirt-daemon-system vagrant
     systemctl enable --now libvirtd
+    apt-get build-dep -y vagrant ruby-libvirt
+    apt-get install -y --no-install-recommends libxslt-dev libxml2-dev libvirt-dev ruby-bundler ruby-dev zlib1g-dev
+    vagrant plugin install vagrant-libvirt
   vagrant_cache:
-    fingerprint_script: uname -s ; cat Vagrantfile.$DISTRO
-    folder: /root/.vagrant.d
+    fingerprint_script: cat Vagrantfile.$DISTRO
+    folder: /root/.vagrant.d/boxes
   vagrant_up_script: |
     ln -sf Vagrantfile.$DISTRO Vagrantfile
     # Retry if it fails (download.fedoraproject.org returns 404 sometimes)
@@ -50,7 +57,7 @@ task:
     mkdir -p -m 0700 /root/.ssh
     vagrant ssh-config >> /root/.ssh/config
   guest_info_script: |
-    ssh default 'sh -exc "uname -a && systemctl --version && df -T && cat /etc/os-release && go version"'
+    ssh default 'sh -exc "uname -a && systemctl --version && df -T && cat /etc/os-release && go version && sestatus && rpm -q container-selinux"'
   check_config_script: |
     ssh default /vagrant/script/check-config.sh
   unit_tests_script: |
@@ -70,19 +77,18 @@ task:
   env:
     HOME: /root
     CIRRUS_WORKING_DIR: /home/runc
-    GO_VERSION: "1.19"
-    BATS_VERSION: "v1.3.0"
-    RPMS: gcc git iptables jq glibc-static libseccomp-devel make criu fuse-sshfs
+    GO_VERSION: "1.23"
+    BATS_VERSION: "v1.9.0"
+    RPMS: gcc git iptables jq glibc-static libseccomp-devel make criu fuse-sshfs container-selinux
     # yamllint disable rule:key-duplicates
     matrix:
-      DISTRO: centos-7
-      DISTRO: centos-stream-8
-      DISTRO: centos-stream-9
+      DISTRO: almalinux-8
+      DISTRO: almalinux-9
 
   name: ci / $DISTRO
 
   compute_engine_instance:
-    image_project: centos-cloud
+    image_project: almalinux-cloud
     image: family/$DISTRO
     platform: linux
     cpu: 4
@@ -90,20 +96,17 @@ task:
 
   install_dependencies_script: |
     case $DISTRO in
-    centos-7)
-      (cd /etc/yum.repos.d && curl -O https://copr.fedorainfracloud.org/coprs/adrian/criu-el7/repo/epel-7/adrian-criu-el7-epel-7.repo)
-      # EPEL is needed for jq and fuse-sshfs.
-      rpm -q epel-release || rpm -Uvh https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
-      # sysctl
-      echo "user.max_user_namespaces=15076" > /etc/sysctl.d/userns.conf
-      sysctl --system
-      ;;
-    centos-stream-8)
+    *-8)
       yum config-manager --set-enabled powertools # for glibc-static
       ;;
-    centos-stream-9)
+    *-9)
       dnf config-manager --set-enabled crb # for glibc-static
-      dnf -y install epel-release epel-next-release # for fuse-sshfs
+      dnf -y install epel-release # for fuse-sshfs
+      # Delegate all cgroup v2 controllers to rootless user via --systemd-cgroup.
+      # The default (since systemd v252) is "pids memory cpu".
+      mkdir -p /etc/systemd/system/user@.service.d
+      printf "[Service]\nDelegate=yes\n" > /etc/systemd/system/user@.service.d/delegate.conf
+      systemctl daemon-reload
       ;;
     esac
     # Work around dnf mirror failures by retrying a few times.
@@ -113,12 +116,11 @@ task:
     done
     [ $? -eq 0 ] # fail if yum failed
 
-    # Double check that all rpms were installed (yum from CentOS 7
-    # does not exit with an error if some packages were not found).
-    # Use --whatprovides since some packages are renamed.
-    rpm -q --whatprovides $RPMS
-    # install Go
-    curl -fsSL "https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz" | tar Cxz /usr/local
+    # Install Go.
+    PREFIX="https://go.dev/dl/"
+    # Find out the latest minor release URL.
+    filename=$(curl -fsSL "${PREFIX}?mode=json&include=all" | jq -r --arg Ver "go$GO_VERSION." '. | map(select(.version | contains($Ver))) | first | .files[] | select(.os == "linux" and .arch == "amd64" and .kind == "archive") | .filename')
+    curl -fsSL "$PREFIX$filename" | tar Cxz /usr/local
     # install bats
     cd /tmp
     git clone https://github.com/bats-core/bats-core
@@ -146,14 +148,18 @@ task:
     systemctl restart sshd
   host_info_script: |
     uname -a
-    echo "-----"
-    cat /etc/os-release
-    echo "-----"
-    cat /proc/cpuinfo
-    echo "-----"
-    df -T
-    echo "-----"
+    # -----
+    /usr/local/go/bin/go version
+    # -----
     systemctl --version
+    # -----
+    cat /etc/os-release
+    # -----
+    df -T
+    # -----
+    sestatus
+    # -----
+    cat /proc/cpuinfo
   check_config_script: |
     /home/runc/script/check-config.sh
   unit_tests_script: |
@@ -163,13 +169,12 @@ task:
   integration_fs_script: |
     ssh -tt localhost "make -C /home/runc localintegration"
   integration_systemd_rootless_script: |
-    echo "SKIP: integration_systemd_rootless_script requires cgroup v2"
-  integration_fs_rootless_script: |
     case $DISTRO in
-    centos-7)
-      echo "SKIP: FIXME: integration_fs_rootless_script is skipped because of EPERM on writing cgroup.procs"
+      *-8)
+        echo "SKIP: integration_systemd_rootless_script requires cgroup v2"
         ;;
-    centos-stream-8)
-      ssh -tt localhost "make -C /home/runc localrootlessintegration"
-      ;;
+      *)
+        ssh -tt localhost "make -C /home/runc localrootlessintegration RUNC_USE_SYSTEMD=yes"
     esac
+  integration_fs_rootless_script: |
+    ssh -tt localhost "make -C /home/runc localrootlessintegration"

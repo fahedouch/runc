@@ -107,14 +107,14 @@ func haveBpfProgReplace() bool {
 			},
 		})
 		if err != nil {
-			logrus.Debugf("checking for BPF_F_REPLACE support: ebpf.NewProgram failed: %v", err)
+			logrus.Warnf("checking for BPF_F_REPLACE support: ebpf.NewProgram failed: %v", err)
 			return
 		}
 		defer prog.Close()
 
 		devnull, err := os.Open("/dev/null")
 		if err != nil {
-			logrus.Debugf("checking for BPF_F_REPLACE support: open dummy target fd: %v", err)
+			logrus.Warnf("checking for BPF_F_REPLACE support: open dummy target fd: %v", err)
 			return
 		}
 		defer devnull.Close()
@@ -123,20 +123,26 @@ func haveBpfProgReplace() bool {
 		// BPF_CGROUP_DEVICE programs. If passing BPF_F_REPLACE gives us EINVAL
 		// we know that the feature isn't present.
 		err = link.RawAttachProgram(link.RawAttachProgramOptions{
-			// We rely on this fd being checked after attachFlags.
+			// We rely on this fd being checked after attachFlags in the kernel.
 			Target: int(devnull.Fd()),
-			// Attempt to "replace" bad fds with this program.
+			// Attempt to "replace" our BPF program with itself. This will
+			// always fail, but we should get -EINVAL if BPF_F_REPLACE is not
+			// supported.
+			Anchor:  link.ReplaceProgram(prog),
 			Program: prog,
 			Attach:  ebpf.AttachCGroupDevice,
-			Flags:   unix.BPF_F_ALLOW_MULTI | unix.BPF_F_REPLACE,
+			Flags:   unix.BPF_F_ALLOW_MULTI,
 		})
-		if errors.Is(err, unix.EINVAL) {
+		if errors.Is(err, ebpf.ErrNotSupported) || errors.Is(err, unix.EINVAL) {
 			// not supported
 			return
 		}
-		// attach_flags test succeeded.
 		if !errors.Is(err, unix.EBADF) {
-			logrus.Debugf("checking for BPF_F_REPLACE: got unexpected (not EBADF or EINVAL) error: %v", err)
+			// If we see any new errors here, it's possible that there is a
+			// regression due to a cilium/ebpf update and the above EINVAL
+			// checks are not working. So, be loud about it so someone notices
+			// and we can get the issue fixed quicker.
+			logrus.Warnf("checking for BPF_F_REPLACE: got unexpected (not EBADF or EINVAL) error: %v", err)
 		}
 		haveBpfProgReplaceBool = true
 	})
@@ -176,21 +182,18 @@ func loadAttachCgroupDeviceFilter(insts asm.Instructions, license string, dirFd 
 	}
 
 	// If there is only one old program, we can just replace it directly.
-	var (
-		replaceProg *ebpf.Program
-		attachFlags uint32 = unix.BPF_F_ALLOW_MULTI
-	)
-	if useReplaceProg {
-		replaceProg = oldProgs[0]
-		attachFlags |= unix.BPF_F_REPLACE
-	}
-	err = link.RawAttachProgram(link.RawAttachProgramOptions{
+
+	attachProgramOptions := link.RawAttachProgramOptions{
 		Target:  dirFd,
 		Program: prog,
-		Replace: replaceProg,
 		Attach:  ebpf.AttachCGroupDevice,
-		Flags:   attachFlags,
-	})
+		Flags:   unix.BPF_F_ALLOW_MULTI,
+	}
+
+	if useReplaceProg {
+		attachProgramOptions.Anchor = link.ReplaceProgram(oldProgs[0])
+	}
+	err = link.RawAttachProgram(attachProgramOptions)
 	if err != nil {
 		return nilCloser, fmt.Errorf("failed to call BPF_PROG_ATTACH (BPF_CGROUP_DEVICE, BPF_F_ALLOW_MULTI): %w", err)
 	}

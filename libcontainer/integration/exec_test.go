@@ -18,6 +18,8 @@ import (
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
 	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/runc/libcontainer/internal/userns"
+	"github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"golang.org/x/sys/unix"
@@ -40,13 +42,7 @@ func testExecPS(t *testing.T, userns bool) {
 	}
 	config := newTemplateConfig(t, &tParam{userns: userns})
 
-	buffers, exitCode, err := runContainer(t, config, "ps", "-o", "pid,user,comm")
-	if err != nil {
-		t.Fatalf("%s: %s", buffers, err)
-	}
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	buffers := runContainerOk(t, config, "ps", "-o", "pid,user,comm")
 	lines := strings.Split(buffers.Stdout.String(), "\n")
 	if len(lines) < 2 {
 		t.Fatalf("more than one process running for output %q", buffers.Stdout.String())
@@ -67,12 +63,7 @@ func TestIPCPrivate(t *testing.T) {
 	ok(t, err)
 
 	config := newTemplateConfig(t, nil)
-	buffers, exitCode, err := runContainer(t, config, "readlink", "/proc/self/ns/ipc")
-	ok(t, err)
-
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	buffers := runContainerOk(t, config, "readlink", "/proc/self/ns/ipc")
 
 	if actual := strings.Trim(buffers.Stdout.String(), "\n"); actual == l {
 		t.Fatalf("ipc link should be private to the container but equals host %q %q", actual, l)
@@ -89,12 +80,7 @@ func TestIPCHost(t *testing.T) {
 
 	config := newTemplateConfig(t, nil)
 	config.Namespaces.Remove(configs.NEWIPC)
-	buffers, exitCode, err := runContainer(t, config, "readlink", "/proc/self/ns/ipc")
-	ok(t, err)
-
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	buffers := runContainerOk(t, config, "readlink", "/proc/self/ns/ipc")
 
 	if actual := strings.Trim(buffers.Stdout.String(), "\n"); actual != l {
 		t.Fatalf("ipc link not equal to host link %q %q", actual, l)
@@ -111,13 +97,7 @@ func TestIPCJoinPath(t *testing.T) {
 
 	config := newTemplateConfig(t, nil)
 	config.Namespaces.Add(configs.NEWIPC, "/proc/1/ns/ipc")
-
-	buffers, exitCode, err := runContainer(t, config, "readlink", "/proc/self/ns/ipc")
-	ok(t, err)
-
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	buffers := runContainerOk(t, config, "readlink", "/proc/self/ns/ipc")
 
 	if actual := strings.Trim(buffers.Stdout.String(), "\n"); actual != l {
 		t.Fatalf("ipc link not equal to host link %q %q", actual, l)
@@ -156,15 +136,16 @@ func testRlimit(t *testing.T, userns bool) {
 
 	config := newTemplateConfig(t, &tParam{userns: userns})
 
-	// ensure limit is lower than what the config requests to test that in a user namespace
+	// Ensure limit is lower than what the config requests to test that in a user namespace
 	// the Setrlimit call happens early enough that we still have permissions to raise the limit.
+	// Do not change the Cur value to be equal to the Max value, please see:
+	// https://github.com/opencontainers/runc/pull/4265#discussion_r1589666444
 	ok(t, unix.Setrlimit(unix.RLIMIT_NOFILE, &unix.Rlimit{
 		Max: 1024,
-		Cur: 1024,
+		Cur: 512,
 	}))
 
-	out, _, err := runContainer(t, config, "/bin/sh", "-c", "ulimit -n")
-	ok(t, err)
+	out := runContainerOk(t, config, "/bin/sh", "-c", "ulimit -n")
 	if limit := strings.TrimSpace(out.Stdout.String()); limit != "1025" {
 		t.Fatalf("expected rlimit to be 1025, got %s", limit)
 	}
@@ -418,7 +399,7 @@ func TestAdditionalGroups(t *testing.T) {
 		Env:              standardEnvironment,
 		Stdin:            nil,
 		Stdout:           &stdout,
-		AdditionalGroups: []string{"plugdev", "audio"},
+		AdditionalGroups: []int{3333, 99999},
 		Init:             true,
 	}
 	err = container.Run(&pconfig)
@@ -429,13 +410,11 @@ func TestAdditionalGroups(t *testing.T) {
 
 	outputGroups := stdout.String()
 
-	// Check that the groups output has the groups that we specified
-	if !strings.Contains(outputGroups, "audio") {
-		t.Fatalf("Listed groups do not contain the audio group as expected: %v", outputGroups)
-	}
-
-	if !strings.Contains(outputGroups, "plugdev") {
-		t.Fatalf("Listed groups do not contain the plugdev group as expected: %v", outputGroups)
+	// Check that the groups output has the groups that we specified.
+	for _, gid := range pconfig.AdditionalGroups {
+		if !strings.Contains(outputGroups, strconv.Itoa(gid)) {
+			t.Errorf("Listed groups do not contain gid %d as expected: %v", gid, outputGroups)
+		}
 	}
 }
 
@@ -491,7 +470,7 @@ func testFreeze(t *testing.T, withSystemd bool, useSet bool) {
 	if !useSet {
 		err = container.Pause()
 	} else {
-		config.Cgroups.Resources.Freezer = configs.Frozen
+		config.Cgroups.Resources.Freezer = cgroups.Frozen
 		err = container.Set(*config)
 	}
 	ok(t, err)
@@ -505,7 +484,7 @@ func testFreeze(t *testing.T, withSystemd bool, useSet bool) {
 	if !useSet {
 		err = container.Resume()
 	} else {
-		config.Cgroups.Resources.Freezer = configs.Thawed
+		config.Cgroups.Resources.Freezer = cgroups.Thawed
 		err = container.Set(*config)
 	}
 	ok(t, err)
@@ -537,7 +516,7 @@ func testCpuShares(t *testing.T, systemd bool) {
 	config.Cgroups.Resources.CpuShares = 1
 
 	if _, _, err := runContainer(t, config, "ps"); err == nil {
-		t.Fatalf("runContainer should failed with invalid CpuShares")
+		t.Fatal("runContainer should fail with invalid CpuShares")
 	}
 }
 
@@ -560,30 +539,20 @@ func testPids(t *testing.T, systemd bool) {
 	config := newTemplateConfig(t, &tParam{systemd: systemd})
 	config.Cgroups.Resources.PidsLimit = -1
 
-	// Running multiple processes.
-	_, ret, err := runContainer(t, config, "/bin/sh", "-c", "/bin/true | /bin/true | /bin/true | /bin/true")
-	ok(t, err)
-
-	if ret != 0 {
-		t.Fatalf("expected fork() to succeed with no pids limit")
-	}
+	// Running multiple processes, expecting it to succeed with no pids limit.
+	_ = runContainerOk(t, config, "/bin/sh", "-c", "/bin/true | /bin/true | /bin/true | /bin/true")
 
 	// Enforce a permissive limit. This needs to be fairly hand-wavey due to the
 	// issues with running Go binaries with pids restrictions (see below).
 	config.Cgroups.Resources.PidsLimit = 64
-	_, ret, err = runContainer(t, config, "/bin/sh", "-c", `
+	_ = runContainerOk(t, config, "/bin/sh", "-c", `
 	/bin/true | /bin/true | /bin/true | /bin/true | /bin/true | /bin/true | bin/true | /bin/true |
 	/bin/true | /bin/true | /bin/true | /bin/true | /bin/true | /bin/true | bin/true | /bin/true |
 	/bin/true | /bin/true | /bin/true | /bin/true | /bin/true | /bin/true | bin/true | /bin/true |
 	/bin/true | /bin/true | /bin/true | /bin/true | /bin/true | /bin/true | bin/true | /bin/true`)
-	ok(t, err)
 
-	if ret != 0 {
-		t.Fatalf("expected fork() to succeed with permissive pids limit")
-	}
-
-	// Enforce a restrictive limit. 64 * /bin/true + 1 * shell should cause this
-	// to fail reliability.
+	// Enforce a restrictive limit. 64 * /bin/true + 1 * shell should cause
+	// this to fail reliably.
 	config.Cgroups.Resources.PidsLimit = 64
 	out, _, err := runContainer(t, config, "/bin/sh", "-c", `
 	/bin/true | /bin/true | /bin/true | /bin/true | /bin/true | /bin/true | bin/true | /bin/true |
@@ -753,7 +722,7 @@ func TestContainerState(t *testing.T) {
 		{Type: configs.NEWNS},
 		{Type: configs.NEWUTS},
 		// host for IPC
-		//{Type: configs.NEWIPC},
+		// {Type: configs.NEWIPC},
 		{Type: configs.NEWPID},
 		{Type: configs.NEWNET},
 	})
@@ -884,13 +853,8 @@ func TestMountCgroupRO(t *testing.T) {
 		return
 	}
 	config := newTemplateConfig(t, nil)
-	buffers, exitCode, err := runContainer(t, config, "mount")
-	if err != nil {
-		t.Fatalf("%s: %s", buffers, err)
-	}
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	buffers := runContainerOk(t, config, "mount")
+
 	mountInfo := buffers.Stdout.String()
 	lines := strings.Split(mountInfo, "\n")
 	for _, l := range lines {
@@ -931,13 +895,8 @@ func TestMountCgroupRW(t *testing.T) {
 		}
 	}
 
-	buffers, exitCode, err := runContainer(t, config, "mount")
-	if err != nil {
-		t.Fatalf("%s: %s", buffers, err)
-	}
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	buffers := runContainerOk(t, config, "mount")
+
 	mountInfo := buffers.Stdout.String()
 	lines := strings.Split(mountInfo, "\n")
 	for _, l := range lines {
@@ -1061,13 +1020,13 @@ func TestHook(t *testing.T) {
 			}),
 		},
 		configs.CreateContainer: configs.HookList{
-			configs.NewCommandHook(configs.Command{
+			configs.NewCommandHook(&configs.Command{
 				Path: "/bin/bash",
 				Args: []string{"/bin/bash", "-c", fmt.Sprintf("touch ./%s", hookFiles[configs.CreateContainer])},
 			}),
 		},
 		configs.StartContainer: configs.HookList{
-			configs.NewCommandHook(configs.Command{
+			configs.NewCommandHook(&configs.Command{
 				Path: "/bin/sh",
 				Args: []string{"/bin/sh", "-c", fmt.Sprintf("touch /%s", hookFiles[configs.StartContainer])},
 			}),
@@ -1148,11 +1107,7 @@ func TestSTDIOPermissions(t *testing.T) {
 	}
 
 	config := newTemplateConfig(t, nil)
-	buffers, exitCode, err := runContainer(t, config, "sh", "-c", "echo hi > /dev/stderr")
-	ok(t, err)
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	buffers := runContainerOk(t, config, "sh", "-c", "echo hi > /dev/stderr")
 
 	if actual := strings.Trim(buffers.Stderr.String(), "\n"); actual != "hi" {
 		t.Fatalf("stderr should equal be equal %q %q", actual, "hi")
@@ -1395,28 +1350,33 @@ func TestPIDHost(t *testing.T) {
 
 	config := newTemplateConfig(t, nil)
 	config.Namespaces.Remove(configs.NEWPID)
-	buffers, exitCode, err := runContainer(t, config, "readlink", "/proc/self/ns/pid")
-	ok(t, err)
-
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	buffers := runContainerOk(t, config, "readlink", "/proc/self/ns/pid")
 
 	if actual := strings.Trim(buffers.Stdout.String(), "\n"); actual != l {
 		t.Fatalf("ipc link not equal to host link %q %q", actual, l)
 	}
 }
 
-func TestPIDHostInitProcessWait(t *testing.T) {
+func TestHostPidnsInitKill(t *testing.T) {
+	config := newTemplateConfig(t, nil)
+	// Implicitly use host pid ns.
+	config.Namespaces.Remove(configs.NEWPID)
+	testPidnsInitKill(t, config)
+}
+
+func TestSharedPidnsInitKill(t *testing.T) {
+	config := newTemplateConfig(t, nil)
+	// Explicitly use host pid ns.
+	config.Namespaces.Add(configs.NEWPID, "/proc/1/ns/pid")
+	testPidnsInitKill(t, config)
+}
+
+func testPidnsInitKill(t *testing.T, config *configs.Config) {
 	if testing.Short() {
 		return
 	}
 
-	pidns := "/proc/1/ns/pid"
-
 	// Run a container with two long-running processes.
-	config := newTemplateConfig(t, nil)
-	config.Namespaces.Add(configs.NEWPID, pidns)
 	container, err := newContainer(t, config)
 	ok(t, err)
 	defer func() {
@@ -1425,7 +1385,7 @@ func TestPIDHostInitProcessWait(t *testing.T) {
 
 	process1 := &libcontainer.Process{
 		Cwd:  "/",
-		Args: []string{"sleep", "100"},
+		Args: []string{"sleep", "1h"},
 		Env:  standardEnvironment,
 		Init: true,
 	}
@@ -1434,25 +1394,26 @@ func TestPIDHostInitProcessWait(t *testing.T) {
 
 	process2 := &libcontainer.Process{
 		Cwd:  "/",
-		Args: []string{"sleep", "100"},
+		Args: []string{"sleep", "1h"},
 		Env:  standardEnvironment,
 		Init: false,
 	}
 	err = container.Run(process2)
 	ok(t, err)
 
-	// Kill the init process and Wait for it.
-	err = process1.Signal(syscall.SIGKILL)
+	// Kill the container.
+	err = container.Signal(syscall.SIGKILL)
 	ok(t, err)
 	_, err = process1.Wait()
 	if err == nil {
 		t.Fatal("expected Wait to indicate failure")
 	}
 
-	// The non-init process must've been killed.
-	err = process2.Signal(syscall.Signal(0))
-	if err == nil || err.Error() != "no such process" {
-		t.Fatalf("expected process to have been killed: %v", err)
+	// The non-init process must've also been killed. If not,
+	// the test will time out.
+	_, err = process2.Wait()
+	if err == nil {
+		t.Fatal("expected Wait to indicate failure")
 	}
 }
 
@@ -1591,6 +1552,11 @@ func TestInitJoinNetworkAndUser(t *testing.T) {
 	config2 := newTemplateConfig(t, &tParam{userns: true})
 	config2.Namespaces.Add(configs.NEWNET, netns1)
 	config2.Namespaces.Add(configs.NEWUSER, userns1)
+	// Emulate specconv.setupUserNamespace().
+	uidMap, gidMap, err := userns.GetUserNamespaceMappings(userns1)
+	ok(t, err)
+	config2.UIDMappings = uidMap
+	config2.GIDMappings = gidMap
 	config2.Cgroups.Path = "integration/test2"
 	container2, err := newContainer(t, config2)
 	ok(t, err)
@@ -1689,12 +1655,7 @@ func TestCGROUPPrivate(t *testing.T) {
 
 	config := newTemplateConfig(t, nil)
 	config.Namespaces.Add(configs.NEWCGROUP, "")
-	buffers, exitCode, err := runContainer(t, config, "readlink", "/proc/self/ns/cgroup")
-	ok(t, err)
-
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	buffers := runContainerOk(t, config, "readlink", "/proc/self/ns/cgroup")
 
 	if actual := strings.Trim(buffers.Stdout.String(), "\n"); actual == l {
 		t.Fatalf("cgroup link should be private to the container but equals host %q %q", actual, l)
@@ -1713,12 +1674,7 @@ func TestCGROUPHost(t *testing.T) {
 	ok(t, err)
 
 	config := newTemplateConfig(t, nil)
-	buffers, exitCode, err := runContainer(t, config, "readlink", "/proc/self/ns/cgroup")
-	ok(t, err)
-
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	buffers := runContainerOk(t, config, "readlink", "/proc/self/ns/cgroup")
 
 	if actual := strings.Trim(buffers.Stdout.String(), "\n"); actual != l {
 		t.Fatalf("cgroup link not equal to host link %q %q", actual, l)
@@ -1736,41 +1692,53 @@ func TestFdLeaksSystemd(t *testing.T) {
 	testFdLeaks(t, true)
 }
 
+func fdList(t *testing.T) []string {
+	procSelfFd, closer := utils.ProcThreadSelf("fd")
+	defer closer()
+
+	fdDir, err := os.Open(procSelfFd)
+	ok(t, err)
+	defer fdDir.Close()
+
+	fds, err := fdDir.Readdirnames(-1)
+	ok(t, err)
+
+	return fds
+}
+
 func testFdLeaks(t *testing.T, systemd bool) {
 	if testing.Short() {
 		return
 	}
 
-	pfd, err := os.Open("/proc/self/fd")
-	ok(t, err)
-	defer pfd.Close()
-	fds0, err := pfd.Readdirnames(0)
-	ok(t, err)
-	_, err = pfd.Seek(0, 0)
-	ok(t, err)
-
 	config := newTemplateConfig(t, &tParam{systemd: systemd})
-	buffers, exitCode, err := runContainer(t, config, "true")
-	ok(t, err)
+	// Run a container once to exclude file descriptors that are only
+	// opened once during the process lifetime by the library and are
+	// never closed. Those are not considered leaks.
+	//
+	// Examples of this open-once file descriptors are:
+	//  - /sys/fs/cgroup dirfd opened by prepareOpenat2 in libct/cgroups;
+	//  - dbus connection opened by getConnection in libct/cgroups/systemd.
+	_ = runContainerOk(t, config, "true")
+	fds0 := fdList(t)
 
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d stderr %q", exitCode, buffers.Stderr)
-	}
+	_ = runContainerOk(t, config, "true")
+	fds1 := fdList(t)
 
-	fds1, err := pfd.Readdirnames(0)
-	ok(t, err)
-
-	if len(fds1) == len(fds0) {
+	if reflect.DeepEqual(fds0, fds1) {
 		return
 	}
 	// Show the extra opened files.
 
 	excludedPaths := []string{
-		"/sys/fs/cgroup",      // opened once, see prepareOpenat2
 		"anon_inode:bpf-prog", // FIXME: see https://github.com/opencontainers/runc/issues/2366#issuecomment-776411392
 	}
 
 	count := 0
+
+	procSelfFd, closer := utils.ProcThreadSelf("fd/")
+	defer closer()
+
 next_fd:
 	for _, fd1 := range fds1 {
 		for _, fd0 := range fds0 {
@@ -1778,7 +1746,7 @@ next_fd:
 				continue next_fd
 			}
 		}
-		dst, _ := os.Readlink("/proc/self/fd/" + fd1)
+		dst, _ := os.Readlink(filepath.Join(procSelfFd, fd1))
 		for _, ex := range excludedPaths {
 			if ex == dst {
 				continue next_fd
@@ -1822,8 +1790,8 @@ func TestBindMountAndUser(t *testing.T) {
 	})
 
 	// Set HostID to 1000 to avoid DAC_OVERRIDE bypassing the purpose of this test.
-	config.UidMappings[0].HostID = 1000
-	config.GidMappings[0].HostID = 1000
+	config.UIDMappings[0].HostID = 1000
+	config.GIDMappings[0].HostID = 1000
 
 	// Set the owner of rootfs to the effective IDs in the host to avoid errors
 	// while creating the folders to perform the mounts.

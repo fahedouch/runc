@@ -6,7 +6,6 @@ import (
 
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/fscommon"
-	"github.com/opencontainers/runc/libcontainer/configs"
 )
 
 const (
@@ -53,7 +52,7 @@ func TestMemorySetMemory(t *testing.T) {
 		"memory.soft_limit_in_bytes": strconv.Itoa(reservationBefore),
 	})
 
-	r := &configs.Resources{
+	r := &cgroups.Resources{
 		Memory:            memoryAfter,
 		MemoryReservation: reservationAfter,
 	}
@@ -91,7 +90,7 @@ func TestMemorySetMemoryswap(t *testing.T) {
 		"memory.memsw.limit_in_bytes": strconv.Itoa(memoryswapBefore),
 	})
 
-	r := &configs.Resources{
+	r := &cgroups.Resources{
 		MemorySwap: memoryswapAfter,
 	}
 	memory := &MemoryGroup{}
@@ -128,7 +127,7 @@ func TestMemorySetMemoryLargerThanSwap(t *testing.T) {
 		"memory.failcnt":            "0",
 	})
 
-	r := &configs.Resources{
+	r := &cgroups.Resources{
 		Memory:     memoryAfter,
 		MemorySwap: memoryswapAfter,
 	}
@@ -169,7 +168,7 @@ func TestMemorySetSwapSmallerThanMemory(t *testing.T) {
 		"memory.memsw.limit_in_bytes": strconv.Itoa(memoryswapBefore),
 	})
 
-	r := &configs.Resources{
+	r := &cgroups.Resources{
 		Memory:     memoryAfter,
 		MemorySwap: memoryswapAfter,
 	}
@@ -205,7 +204,7 @@ func TestMemorySetMemorySwappinessDefault(t *testing.T) {
 		"memory.swappiness": strconv.Itoa(swappinessBefore),
 	})
 
-	r := &configs.Resources{
+	r := &cgroups.Resources{
 		MemorySwappiness: &swappinessAfter,
 	}
 	memory := &MemoryGroup{}
@@ -249,12 +248,13 @@ func TestMemoryStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectedStats := cgroups.MemoryStats{
-		Cache:        512,
-		Usage:        cgroups.MemoryData{Usage: 2048, MaxUsage: 4096, Failcnt: 100, Limit: 8192},
-		SwapUsage:    cgroups.MemoryData{Usage: 2048, MaxUsage: 4096, Failcnt: 100, Limit: 8192},
-		KernelUsage:  cgroups.MemoryData{Usage: 2048, MaxUsage: 4096, Failcnt: 100, Limit: 8192},
-		Stats:        map[string]uint64{"cache": 512, "rss": 1024},
-		UseHierarchy: true,
+		Cache:         512,
+		Usage:         cgroups.MemoryData{Usage: 2048, MaxUsage: 4096, Failcnt: 100, Limit: 8192},
+		SwapUsage:     cgroups.MemoryData{Usage: 2048, MaxUsage: 4096, Failcnt: 100, Limit: 8192},
+		SwapOnlyUsage: cgroups.MemoryData{Usage: 0, MaxUsage: 0, Failcnt: 0, Limit: 0},
+		KernelUsage:   cgroups.MemoryData{Usage: 2048, MaxUsage: 4096, Failcnt: 100, Limit: 8192},
+		Stats:         map[string]uint64{"cache": 512, "rss": 1024},
+		UseHierarchy:  true,
 		PageUsageByNUMA: cgroups.PageUsageByNUMA{
 			PageUsageByNUMAInner: cgroups.PageUsageByNUMAInner{
 				Total:       cgroups.PageStats{Total: 44611, Nodes: map[uint8]uint64{0: 32631, 1: 7501, 2: 1982, 3: 2497}},
@@ -417,7 +417,7 @@ func TestMemorySetOomControl(t *testing.T) {
 	})
 
 	memory := &MemoryGroup{}
-	r := &configs.Resources{}
+	r := &cgroups.Resources{}
 	if err := memory.Set(path, r); err != nil {
 		t.Fatal(err)
 	}

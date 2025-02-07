@@ -16,7 +16,6 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/opencontainers/runc/libcontainer/cgroups"
-	"github.com/opencontainers/runc/libcontainer/configs"
 )
 
 const (
@@ -33,7 +32,12 @@ var (
 	isRunningSystemdOnce sync.Once
 	isRunningSystemd     bool
 
-	GenerateDeviceProps func(*configs.Resources) ([]systemdDbus.Property, error)
+	// GenerateDeviceProps is a function to generate systemd device
+	// properties, used by Set methods. Unless
+	// [github.com/opencontainers/runc/libcontainer/cgroups/devices]
+	// package is imported, it is set to nil, so cgroup managers can't
+	// configure devices.
+	GenerateDeviceProps func(r *cgroups.Resources, sdVer int) ([]systemdDbus.Property, error)
 )
 
 // NOTE: This function comes from package github.com/coreos/go-systemd/util
@@ -92,7 +96,7 @@ func newProp(name string, units interface{}) systemdDbus.Property {
 	}
 }
 
-func getUnitName(c *configs.Cgroup) string {
+func getUnitName(c *cgroups.Cgroup) string {
 	// by default, we create a scope unless the user explicitly asks for a slice.
 	if !strings.HasSuffix(c.Name, ".slice") {
 		return c.ScopePrefix + "-" + c.Name + ".scope"
@@ -124,30 +128,53 @@ func isUnitExists(err error) bool {
 	return isDbusError(err, "org.freedesktop.systemd1.UnitExists")
 }
 
-func startUnit(cm *dbusConnManager, unitName string, properties []systemdDbus.Property) error {
+func startUnit(cm *dbusConnManager, unitName string, properties []systemdDbus.Property, ignoreExist bool) error {
 	statusChan := make(chan string, 1)
+	retry := true
+
+retry:
 	err := cm.retryOnDisconnect(func(c *systemdDbus.Conn) error {
 		_, err := c.StartTransientUnitContext(context.TODO(), unitName, "replace", properties, statusChan)
 		return err
 	})
-	if err == nil {
-		timeout := time.NewTimer(30 * time.Second)
-		defer timeout.Stop()
-
-		select {
-		case s := <-statusChan:
-			close(statusChan)
-			// Please refer to https://pkg.go.dev/github.com/coreos/go-systemd/v22/dbus#Conn.StartUnit
-			if s != "done" {
-				resetFailedUnit(cm, unitName)
-				return fmt.Errorf("error creating systemd unit `%s`: got `%s`", unitName, s)
-			}
-		case <-timeout.C:
-			resetFailedUnit(cm, unitName)
-			return errors.New("Timeout waiting for systemd to create " + unitName)
+	if err != nil {
+		if !isUnitExists(err) {
+			return err
 		}
-	} else if !isUnitExists(err) {
+		if ignoreExist {
+			// TODO: remove this hack.
+			// This is kubelet making sure a slice exists (see
+			// https://github.com/opencontainers/runc/pull/1124).
+			return nil
+		}
+		if retry {
+			// In case a unit with the same name exists, this may
+			// be a leftover failed unit. Reset it, so systemd can
+			// remove it, and retry once.
+			err = resetFailedUnit(cm, unitName)
+			if err != nil {
+				logrus.Warnf("unable to reset failed unit: %v", err)
+			}
+			retry = false
+			goto retry
+		}
 		return err
+	}
+
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
+
+	select {
+	case s := <-statusChan:
+		close(statusChan)
+		// Please refer to https://pkg.go.dev/github.com/coreos/go-systemd/v22/dbus#Conn.StartUnit
+		if s != "done" {
+			_ = resetFailedUnit(cm, unitName)
+			return fmt.Errorf("error creating systemd unit `%s`: got `%s`", unitName, s)
+		}
+	case <-timeout.C:
+		_ = resetFailedUnit(cm, unitName)
+		return errors.New("Timeout waiting for systemd to create " + unitName)
 	}
 
 	return nil
@@ -174,16 +201,17 @@ func stopUnit(cm *dbusConnManager, unitName string) error {
 			return errors.New("Timed out while waiting for systemd to remove " + unitName)
 		}
 	}
+
+	// In case of a failed unit, let systemd remove it.
+	_ = resetFailedUnit(cm, unitName)
+
 	return nil
 }
 
-func resetFailedUnit(cm *dbusConnManager, name string) {
-	err := cm.retryOnDisconnect(func(c *systemdDbus.Conn) error {
+func resetFailedUnit(cm *dbusConnManager, name string) error {
+	return cm.retryOnDisconnect(func(c *systemdDbus.Conn) error {
 		return c.ResetFailedUnitContext(context.TODO(), name)
 	})
-	if err != nil {
-		logrus.Warnf("unable to reset failed unit: %v", err)
-	}
 }
 
 func getUnitTypeProperty(cm *dbusConnManager, unitName string, unitType string, propertyName string) (*systemdDbus.Property, error) {
@@ -322,7 +350,7 @@ func addCpuset(cm *dbusConnManager, props *[]systemdDbus.Property, cpus, mems st
 
 // generateDeviceProperties takes the configured device rules and generates a
 // corresponding set of systemd properties to configure the devices correctly.
-func generateDeviceProperties(r *configs.Resources) ([]systemdDbus.Property, error) {
+func generateDeviceProperties(r *cgroups.Resources, cm *dbusConnManager) ([]systemdDbus.Property, error) {
 	if GenerateDeviceProps == nil {
 		if len(r.Devices) > 0 {
 			return nil, cgroups.ErrDevicesUnsupported
@@ -330,5 +358,5 @@ func generateDeviceProperties(r *configs.Resources) ([]systemdDbus.Property, err
 		return nil, nil
 	}
 
-	return GenerateDeviceProps(r)
+	return GenerateDeviceProps(r, systemdVersion(cm))
 }

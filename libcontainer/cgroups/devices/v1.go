@@ -5,15 +5,14 @@ import (
 	"errors"
 	"reflect"
 
+	"github.com/moby/sys/userns"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
-	"github.com/opencontainers/runc/libcontainer/configs"
-	"github.com/opencontainers/runc/libcontainer/devices"
-	"github.com/opencontainers/runc/libcontainer/userns"
+	devices "github.com/opencontainers/runc/libcontainer/cgroups/devices/config"
 )
 
 var testingSkipFinalCheck bool
 
-func setV1(path string, r *configs.Resources) error {
+func setV1(path string, r *cgroups.Resources) error {
 	if userns.RunningInUserNS() || r.SkipDevices {
 		return nil
 	}

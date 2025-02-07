@@ -5,20 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime/debug"
-	"strconv"
 
 	securejoin "github.com/cyphar/filepath-securejoin"
 	"golang.org/x/sys/unix"
 
-	//nolint:revive // Enable cgroup manager to manage devices
-	_ "github.com/opencontainers/runc/libcontainer/cgroups/devices"
+	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/manager"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/configs/validate"
 	"github.com/opencontainers/runc/libcontainer/intelrdt"
 	"github.com/opencontainers/runc/libcontainer/utils"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -49,11 +45,11 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
-	containerRoot, err := securejoin.SecureJoin(root, id)
+	stateDir, err := securejoin.SecureJoin(root, id)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(containerRoot); err == nil {
+	if _, err := os.Stat(stateDir); err == nil {
 		return nil, ErrExist
 	} else if !os.IsNotExist(err) {
 		return nil, err
@@ -77,9 +73,7 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 			return nil, fmt.Errorf("unable to get cgroup PIDs: %w", err)
 		}
 		if len(pids) != 0 {
-			// TODO: return an error.
-			logrus.Warnf("container's cgroup is not empty: %d process(es) found", len(pids))
-			logrus.Warn("DEPRECATED: running container in a non-empty cgroup won't be supported in runc 1.2; https://github.com/opencontainers/runc/issues/3132")
+			return nil, fmt.Errorf("container's cgroup is not empty: %d process(es) found", len(pids))
 		}
 	}
 
@@ -89,17 +83,17 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to get cgroup freezer state: %w", err)
 	}
-	if st == configs.Frozen {
+	if st == cgroups.Frozen {
 		return nil, errors.New("container's cgroup unexpectedly frozen")
 	}
 
 	// Parent directory is already created above, so Mkdir is enough.
-	if err := os.Mkdir(containerRoot, 0o711); err != nil {
+	if err := os.Mkdir(stateDir, 0o711); err != nil {
 		return nil, err
 	}
 	c := &Container{
 		id:              id,
-		root:            containerRoot,
+		stateDir:        stateDir,
 		config:          config,
 		cgroupManager:   cm,
 		intelRdtManager: intelrdt.NewManager(config, id, ""),
@@ -119,11 +113,11 @@ func Load(root, id string) (*Container, error) {
 	if err := validateID(id); err != nil {
 		return nil, err
 	}
-	containerRoot, err := securejoin.SecureJoin(root, id)
+	stateDir, err := securejoin.SecureJoin(root, id)
 	if err != nil {
 		return nil, err
 	}
-	state, err := loadState(containerRoot)
+	state, err := loadState(stateDir)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +137,7 @@ func Load(root, id string) (*Container, error) {
 		config:               &state.Config,
 		cgroupManager:        cm,
 		intelRdtManager:      intelrdt.NewManager(&state.Config, id, state.IntelRdtPath),
-		root:                 containerRoot,
+		stateDir:             stateDir,
 		created:              state.Created,
 	}
 	c.state = &loadedState{c: c}
@@ -151,90 +145,6 @@ func Load(root, id string) (*Container, error) {
 		return nil, err
 	}
 	return c, nil
-}
-
-// StartInitialization loads a container by opening the pipe fd from the parent
-// to read the configuration and state. This is a low level implementation
-// detail of the reexec and should not be consumed externally.
-func StartInitialization() (err error) {
-	// Get the INITPIPE.
-	envInitPipe := os.Getenv("_LIBCONTAINER_INITPIPE")
-	pipefd, err := strconv.Atoi(envInitPipe)
-	if err != nil {
-		err = fmt.Errorf("unable to convert _LIBCONTAINER_INITPIPE: %w", err)
-		logrus.Error(err)
-		return err
-	}
-	pipe := os.NewFile(uintptr(pipefd), "pipe")
-	defer pipe.Close()
-
-	defer func() {
-		// We have an error during the initialization of the container's init,
-		// send it back to the parent process in the form of an initError.
-		if werr := writeSync(pipe, procError); werr != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return
-		}
-		if werr := utils.WriteJSON(pipe, &initError{Message: err.Error()}); werr != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return
-		}
-	}()
-
-	// Only init processes have FIFOFD.
-	fifofd := -1
-	envInitType := os.Getenv("_LIBCONTAINER_INITTYPE")
-	it := initType(envInitType)
-	if it == initStandard {
-		envFifoFd := os.Getenv("_LIBCONTAINER_FIFOFD")
-		if fifofd, err = strconv.Atoi(envFifoFd); err != nil {
-			return fmt.Errorf("unable to convert _LIBCONTAINER_FIFOFD: %w", err)
-		}
-	}
-
-	var consoleSocket *os.File
-	if envConsole := os.Getenv("_LIBCONTAINER_CONSOLE"); envConsole != "" {
-		console, err := strconv.Atoi(envConsole)
-		if err != nil {
-			return fmt.Errorf("unable to convert _LIBCONTAINER_CONSOLE: %w", err)
-		}
-		consoleSocket = os.NewFile(uintptr(console), "console-socket")
-		defer consoleSocket.Close()
-	}
-
-	logPipeFdStr := os.Getenv("_LIBCONTAINER_LOGPIPE")
-	logPipeFd, err := strconv.Atoi(logPipeFdStr)
-	if err != nil {
-		return fmt.Errorf("unable to convert _LIBCONTAINER_LOGPIPE: %w", err)
-	}
-
-	// Get mount files (O_PATH).
-	mountFds, err := parseMountFds()
-	if err != nil {
-		return err
-	}
-
-	// clear the current process's environment to clean any libcontainer
-	// specific env vars.
-	os.Clearenv()
-
-	defer func() {
-		if e := recover(); e != nil {
-			if ee, ok := e.(error); ok {
-				err = fmt.Errorf("panic from initialization: %w, %s", ee, debug.Stack())
-			} else {
-				err = fmt.Errorf("panic from initialization: %v, %s", e, debug.Stack())
-			}
-		}
-	}()
-
-	i, err := newContainerInit(it, pipe, consoleSocket, fifofd, logPipeFd, mountFds)
-	if err != nil {
-		return err
-	}
-
-	// If Init succeeds, syscall.Exec will not return, hence none of the defers will be called.
-	return i.Init()
 }
 
 func loadState(root string) (*State, error) {
@@ -302,19 +212,4 @@ func validateID(id string) error {
 	}
 
 	return nil
-}
-
-func parseMountFds() ([]int, error) {
-	fdsJSON := os.Getenv("_LIBCONTAINER_MOUNT_FDS")
-	if fdsJSON == "" {
-		// Always return the nil slice if no fd is present.
-		return nil, nil
-	}
-
-	var mountFds []int
-	if err := json.Unmarshal([]byte(fdsJSON), &mountFds); err != nil {
-		return nil, fmt.Errorf("Error unmarshalling _LIBCONTAINER_MOUNT_FDS: %w", err)
-	}
-
-	return mountFds, nil
 }

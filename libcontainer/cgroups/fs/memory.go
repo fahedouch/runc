@@ -14,7 +14,6 @@ import (
 
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/fscommon"
-	"github.com/opencontainers/runc/libcontainer/configs"
 )
 
 const (
@@ -30,7 +29,7 @@ func (s *MemoryGroup) Name() string {
 	return "memory"
 }
 
-func (s *MemoryGroup) Apply(path string, _ *configs.Resources, pid int) error {
+func (s *MemoryGroup) Apply(path string, _ *cgroups.Resources, pid int) error {
 	return apply(path, pid)
 }
 
@@ -66,7 +65,7 @@ func setSwap(path string, val int64) error {
 	return cgroups.WriteFile(path, cgroupMemorySwapLimit, strconv.FormatInt(val, 10))
 }
 
-func setMemoryAndSwap(path string, r *configs.Resources) error {
+func setMemoryAndSwap(path string, r *cgroups.Resources) error {
 	// If the memory update is set to -1 and the swap is not explicitly
 	// set, we should also set swap to -1, it means unlimited memory.
 	if r.Memory == -1 && r.MemorySwap == 0 {
@@ -108,7 +107,7 @@ func setMemoryAndSwap(path string, r *configs.Resources) error {
 	return nil
 }
 
-func (s *MemoryGroup) Set(path string, r *configs.Resources) error {
+func (s *MemoryGroup) Set(path string, r *cgroups.Resources) error {
 	if err := setMemoryAndSwap(path, r); err != nil {
 		return err
 	}
@@ -170,6 +169,10 @@ func (s *MemoryGroup) GetStats(path string, stats *cgroups.Stats) error {
 		return err
 	}
 	stats.MemoryStats.SwapUsage = swapUsage
+	stats.MemoryStats.SwapOnlyUsage = cgroups.MemoryData{
+		Usage:   swapUsage.Usage - memoryUsage.Usage,
+		Failcnt: swapUsage.Failcnt - memoryUsage.Failcnt,
+	}
 	kernelUsage, err := getMemoryData(path, "kmem")
 	if err != nil {
 		return err
@@ -234,6 +237,12 @@ func getMemoryData(path, name string) (cgroups.MemoryData, error) {
 	memoryData.Failcnt = value
 	value, err = fscommon.GetCgroupParamUint(path, limit)
 	if err != nil {
+		if name == "kmem" && os.IsNotExist(err) {
+			// Ignore ENOENT as kmem.limit_in_bytes has
+			// been removed in newer kernels.
+			return memoryData, nil
+		}
+
 		return cgroups.MemoryData{}, err
 	}
 	memoryData.Limit = value
@@ -272,11 +281,11 @@ func getPageUsageByNUMA(path string) (cgroups.PageUsageByNUMA, error) {
 		line := scanner.Text()
 		columns := strings.SplitN(line, " ", maxColumns)
 		for i, column := range columns {
-			byNode := strings.SplitN(column, "=", 2)
+			key, val, ok := strings.Cut(column, "=")
 			// Some custom kernels have non-standard fields, like
 			//   numa_locality 0 0 0 0 0 0 0 0 0 0
 			//   numa_exectime 0
-			if len(byNode) < 2 {
+			if !ok {
 				if i == 0 {
 					// Ignore/skip those.
 					break
@@ -286,7 +295,6 @@ func getPageUsageByNUMA(path string) (cgroups.PageUsageByNUMA, error) {
 					return stats, malformedLine(path, file, line)
 				}
 			}
-			key, val := byNode[0], byNode[1]
 			if i == 0 { // First column: key is name, val is total.
 				field = getNUMAField(&stats, key)
 				if field == nil { // unknown field (new kernel?)

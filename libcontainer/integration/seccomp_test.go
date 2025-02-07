@@ -1,5 +1,4 @@
 //go:build linux && cgo && seccomp
-// +build linux,cgo,seccomp
 
 package integration
 
@@ -13,7 +12,7 @@ import (
 	libseccomp "github.com/seccomp/libseccomp-golang"
 )
 
-func TestSeccompDenyGetcwdWithErrno(t *testing.T) {
+func TestSeccompDenySyslogWithErrno(t *testing.T) {
 	if testing.Short() {
 		return
 	}
@@ -25,7 +24,7 @@ func TestSeccompDenyGetcwdWithErrno(t *testing.T) {
 		DefaultAction: configs.Allow,
 		Syscalls: []*configs.Syscall{
 			{
-				Name:     "getcwd",
+				Name:     "syslog",
 				Action:   configs.Errno,
 				ErrnoRet: &errnoRet,
 			},
@@ -39,7 +38,7 @@ func TestSeccompDenyGetcwdWithErrno(t *testing.T) {
 	buffers := newStdBuffers()
 	pwd := &libcontainer.Process{
 		Cwd:    "/",
-		Args:   []string{"pwd"},
+		Args:   []string{"dmesg"},
 		Env:    standardEnvironment,
 		Stdin:  buffers.Stdin,
 		Stdout: buffers.Stdout,
@@ -53,29 +52,18 @@ func TestSeccompDenyGetcwdWithErrno(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expecting error (negative return code); instead exited cleanly!")
 	}
-
-	var exitCode int
-	status := ps.Sys().(syscall.WaitStatus)
-	if status.Exited() {
-		exitCode = status.ExitStatus()
-	} else if status.Signaled() {
-		exitCode = -int(status.Signal())
-	} else {
-		t.Fatalf("Unrecognized exit reason!")
+	if ps.Success() {
+		t.Fatal("dmesg should fail with negative exit code, instead got 0!")
 	}
 
-	if exitCode == 0 {
-		t.Fatalf("Getcwd should fail with negative exit code, instead got %d!", exitCode)
-	}
-
-	expected := "pwd: getcwd: No such process"
+	expected := "dmesg: klogctl: No such process"
 	actual := strings.Trim(buffers.Stderr.String(), "\n")
 	if actual != expected {
 		t.Fatalf("Expected output %s but got %s\n", expected, actual)
 	}
 }
 
-func TestSeccompDenyGetcwd(t *testing.T) {
+func TestSeccompDenySyslog(t *testing.T) {
 	if testing.Short() {
 		return
 	}
@@ -85,7 +73,7 @@ func TestSeccompDenyGetcwd(t *testing.T) {
 		DefaultAction: configs.Allow,
 		Syscalls: []*configs.Syscall{
 			{
-				Name:   "getcwd",
+				Name:   "syslog",
 				Action: configs.Errno,
 			},
 		},
@@ -98,7 +86,7 @@ func TestSeccompDenyGetcwd(t *testing.T) {
 	buffers := newStdBuffers()
 	pwd := &libcontainer.Process{
 		Cwd:    "/",
-		Args:   []string{"pwd"},
+		Args:   []string{"dmesg"},
 		Env:    standardEnvironment,
 		Stdin:  buffers.Stdin,
 		Stdout: buffers.Stdout,
@@ -112,22 +100,11 @@ func TestSeccompDenyGetcwd(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expecting error (negative return code); instead exited cleanly!")
 	}
-
-	var exitCode int
-	status := ps.Sys().(syscall.WaitStatus)
-	if status.Exited() {
-		exitCode = status.ExitStatus()
-	} else if status.Signaled() {
-		exitCode = -int(status.Signal())
-	} else {
-		t.Fatalf("Unrecognized exit reason!")
+	if ps.Success() {
+		t.Fatal("dmesg should fail with negative exit code, instead got 0!")
 	}
 
-	if exitCode == 0 {
-		t.Fatalf("Getcwd should fail with negative exit code, instead got %d!", exitCode)
-	}
-
-	expected := "pwd: getcwd: Operation not permitted"
+	expected := "dmesg: klogctl: Operation not permitted"
 	actual := strings.Trim(buffers.Stderr.String(), "\n")
 	if actual != expected {
 		t.Fatalf("Expected output %s but got %s\n", expected, actual)
@@ -231,19 +208,8 @@ func TestSeccompDenyWriteConditional(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expecting negative return, instead got 0!")
 	}
-
-	var exitCode int
-	status := ps.Sys().(syscall.WaitStatus)
-	if status.Exited() {
-		exitCode = status.ExitStatus()
-	} else if status.Signaled() {
-		exitCode = -int(status.Signal())
-	} else {
-		t.Fatalf("Unrecognized exit reason!")
-	}
-
-	if exitCode == 0 {
-		t.Fatalf("Busybox should fail with negative exit code, instead got %d!", exitCode)
+	if ps.Success() {
+		t.Fatal("Busybox should fail with negative exit code, instead got 0!")
 	}
 
 	// We're denying write to stderr, so we expect an empty buffer
@@ -282,13 +248,7 @@ func TestSeccompPermitWriteMultipleConditions(t *testing.T) {
 		},
 	}
 
-	buffers, exitCode, err := runContainer(t, config, "ls", "/")
-	if err != nil {
-		t.Fatalf("%s: %s", buffers, err)
-	}
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d buffers %s", exitCode, buffers)
-	}
+	buffers := runContainerOk(t, config, "ls", "/")
 	// We don't need to verify the actual thing printed
 	// Just that something was written to stdout
 	if len(buffers.Stdout.String()) == 0 {
@@ -375,13 +335,7 @@ func TestSeccompMultipleConditionSameArgDeniesStdout(t *testing.T) {
 		},
 	}
 
-	buffers, exitCode, err := runContainer(t, config, "ls", "/")
-	if err != nil {
-		t.Fatalf("%s: %s", buffers, err)
-	}
-	if exitCode != 0 {
-		t.Fatalf("exit code not 0. code %d buffers %s", exitCode, buffers)
-	}
+	buffers := runContainerOk(t, config, "ls", "/")
 	// Verify that nothing was printed
 	if len(buffers.Stdout.String()) != 0 {
 		t.Fatalf("Something was written to stdout, write call succeeded!\n")

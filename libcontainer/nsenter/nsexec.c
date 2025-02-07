@@ -4,7 +4,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
-#include <limits.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -27,10 +26,10 @@
 #include <linux/netlink.h>
 #include <linux/types.h>
 
+#include "getenv.h"
+#include "log.h"
 /* Get all of the CLONE_NEW* flags. */
 #include "namespace.h"
-
-extern char *escape_json_string(char *str);
 
 /* Synchronisation values. */
 enum sync_t {
@@ -40,8 +39,8 @@ enum sync_t {
 	SYNC_RECVPID_ACK = 0x43,	/* PID was correctly received by parent. */
 	SYNC_GRANDCHILD = 0x44,	/* The grandchild is ready to run. */
 	SYNC_CHILD_FINISH = 0x45,	/* The child or grandchild has finished. */
-	SYNC_MOUNTSOURCES_PLS = 0x46,	/* Tell parent to send mount sources by SCM_RIGHTS. */
-	SYNC_MOUNTSOURCES_ACK = 0x47,	/* All mount sources have been sent. */
+	SYNC_TIMEOFFSETS_PLS = 0x46,	/* Request parent to write timens offsets. */
+	SYNC_TIMEOFFSETS_ACK = 0x47,	/* Timens offsets were written. */
 };
 
 #define STAGE_SETUP  -1
@@ -91,26 +90,10 @@ struct nlconfig_t {
 	char *gidmappath;
 	size_t gidmappath_len;
 
-	/* Mount sources opened outside the container userns. */
-	char *mountsources;
-	size_t mountsources_len;
+	/* Time NS offsets. */
+	char *timensoffset;
+	size_t timensoffset_len;
 };
-
-/*
- * Log levels are the same as in logrus.
- */
-#define PANIC   0
-#define FATAL   1
-#define ERROR   2
-#define WARNING 3
-#define INFO    4
-#define DEBUG   5
-#define TRACE   6
-
-static const char *level_str[] = { "panic", "fatal", "error", "warning", "info", "debug", "trace" };
-
-static int logfd = -1;
-static int loglevel = DEBUG;
 
 /*
  * List of netlink message types sent to us as part of bootstrapping the init.
@@ -126,7 +109,7 @@ static int loglevel = DEBUG;
 #define ROOTLESS_EUID_ATTR	27287
 #define UIDMAPPATH_ATTR		27288
 #define GIDMAPPATH_ATTR		27289
-#define MOUNT_SOURCES_ATTR	27290
+#define TIMENSOFFSET_ATTR	27290
 
 /*
  * Use the raw syscall for versions of glibc which don't include a function for
@@ -149,66 +132,8 @@ int setns(int fd, int nstype)
 }
 #endif
 
-static void write_log(int level, const char *format, ...)
-{
-	char *message = NULL, *stage = NULL, *json = NULL;
-	va_list args;
-	int ret;
-
-	if (logfd < 0 || level > loglevel)
-		goto out;
-
-	va_start(args, format);
-	ret = vasprintf(&message, format, args);
-	va_end(args);
-	if (ret < 0) {
-		message = NULL;
-		goto out;
-	}
-
-	message = escape_json_string(message);
-
-	if (current_stage == STAGE_SETUP) {
-		stage = strdup("nsexec");
-		if (stage == NULL)
-			goto out;
-	} else {
-		ret = asprintf(&stage, "nsexec-%d", current_stage);
-		if (ret < 0) {
-			stage = NULL;
-			goto out;
-		}
-	}
-	ret = asprintf(&json, "{\"level\":\"%s\", \"msg\": \"%s[%d]: %s\"}\n",
-		       level_str[level], stage, getpid(), message);
-	if (ret < 0) {
-		json = NULL;
-		goto out;
-	}
-
-	/* This logging is on a best-effort basis. In case of a short or failed
-	 * write there is nothing we can do, so just ignore write() errors.
-	 */
-	ssize_t __attribute__((unused)) __res = write(logfd, json, ret);
-
-out:
-	free(message);
-	free(stage);
-	free(json);
-}
-
 /* XXX: This is ugly. */
 static int syncfd = -1;
-
-#define bail(fmt, ...)                                               \
-	do {                                                         \
-		if (logfd < 0)                                       \
-			fprintf(stderr, "FATAL: " fmt ": %m\n",      \
-				##__VA_ARGS__);                      \
-		else                                                 \
-			write_log(FATAL, fmt ": %m", ##__VA_ARGS__); \
-		exit(1);                                             \
-	} while(0)
 
 static int write_file(char *data, size_t data_len, char *pathfmt, ...)
 {
@@ -397,78 +322,6 @@ static int clone_parent(jmp_buf *env, int jmpval)
 	return clone(child_func, ca.stack_ptr, CLONE_PARENT | SIGCHLD, &ca);
 }
 
-/*
- * Returns an environment variable value as a non-negative integer, or -ENOENT
- * if the variable was not found or has an empty value.
- *
- * If the value can not be converted to an integer, or the result is out of
- * range, the function bails out.
- */
-static int getenv_int(const char *name)
-{
-	char *val, *endptr;
-	int ret;
-
-	val = getenv(name);
-	/* Treat empty value as unset variable. */
-	if (val == NULL || *val == '\0')
-		return -ENOENT;
-
-	ret = strtol(val, &endptr, 10);
-	if (val == endptr || *endptr != '\0')
-		bail("unable to parse %s=%s", name, val);
-	/*
-	 * Sanity check: this must be a non-negative number.
-	 */
-	if (ret < 0)
-		bail("bad value for %s=%s (%d)", name, val, ret);
-
-	return ret;
-}
-
-/*
- * Sets up logging by getting log fd and log level from the environment,
- * if available.
- */
-static void setup_logpipe(void)
-{
-	int i;
-
-	i = getenv_int("_LIBCONTAINER_LOGPIPE");
-	if (i < 0) {
-		/* We are not runc init, or log pipe was not provided. */
-		return;
-	}
-	logfd = i;
-
-	i = getenv_int("_LIBCONTAINER_LOGLEVEL");
-	if (i < 0)
-		return;
-	loglevel = i;
-}
-
-/* Returns the clone(2) flag for a namespace, given the name of a namespace. */
-static int nsflag(char *name)
-{
-	if (!strcmp(name, "cgroup"))
-		return CLONE_NEWCGROUP;
-	else if (!strcmp(name, "ipc"))
-		return CLONE_NEWIPC;
-	else if (!strcmp(name, "mnt"))
-		return CLONE_NEWNS;
-	else if (!strcmp(name, "net"))
-		return CLONE_NEWNET;
-	else if (!strcmp(name, "pid"))
-		return CLONE_NEWPID;
-	else if (!strcmp(name, "user"))
-		return CLONE_NEWUSER;
-	else if (!strcmp(name, "uts"))
-		return CLONE_NEWUTS;
-
-	/* If we don't recognise a name, fallback to 0. */
-	return 0;
-}
-
 static uint32_t readint32(char *buf)
 {
 	return *(uint32_t *) buf;
@@ -550,9 +403,9 @@ static void nl_parse(int fd, struct nlconfig_t *config)
 		case SETGROUP_ATTR:
 			config->is_setgroup = readint8(current);
 			break;
-		case MOUNT_SOURCES_ATTR:
-			config->mountsources = current;
-			config->mountsources_len = payload_len;
+		case TIMENSOFFSET_ATTR:
+			config->timensoffset = current;
+			config->timensoffset_len = payload_len;
 			break;
 		default:
 			bail("unknown netlink message type %d", nlattr->nla_type);
@@ -567,35 +420,67 @@ void nl_free(struct nlconfig_t *config)
 	free(config->data);
 }
 
-void join_namespaces(char *nslist)
-{
-	int num = 0, i;
-	char *saveptr = NULL;
-	char *namespace = strtok_r(nslist, ",", &saveptr);
-	struct namespace_t {
-		int fd;
-		char type[PATH_MAX];
-		char path[PATH_MAX];
-	} *namespaces = NULL;
+struct namespace_t {
+	int fd;
+	char type[PATH_MAX];
+	char path[PATH_MAX];
+};
 
-	if (!namespace || !strlen(namespace) || !strlen(nslist))
+typedef int nsset_t;
+
+static struct nstype_t {
+	int type;
+	char *name;
+} all_ns_types[] = {
+	{ CLONE_NEWCGROUP, "cgroup" },
+	{ CLONE_NEWIPC, "ipc" },
+	{ CLONE_NEWNS, "mnt" },
+	{ CLONE_NEWNET, "net" },
+	{ CLONE_NEWPID, "pid" },
+	{ CLONE_NEWTIME, "time" },
+	{ CLONE_NEWUSER, "user" },
+	{ CLONE_NEWUTS, "uts" },
+	{ },			/* null terminator */
+};
+
+/* Returns the clone(2) flag for a namespace, given the name of a namespace. */
+static int nstype(char *name)
+{
+	for (struct nstype_t * ns = all_ns_types; ns->name != NULL; ns++)
+		if (!strcmp(name, ns->name))
+			return ns->type;
+	/*
+	 * setns(2) lets us join namespaces without knowing the type, but
+	 * namespaces usually require special handling of some kind (so joining
+	 * a namespace without knowing its type or joining a new namespace type
+	 * without corresponding handling could result in broken behaviour) and
+	 * the rest of runc doesn't allow unknown namespace types anyway.
+	 */
+	bail("unknown namespace type %s", name);
+}
+
+static nsset_t __open_namespaces(char *nsspec, struct namespace_t **ns_list, size_t *ns_len)
+{
+	int len = 0;
+	nsset_t ns_to_join = 0;
+	char *namespace, *saveptr = NULL;
+	struct namespace_t *namespaces = NULL;
+
+	namespace = strtok_r(nsspec, ",", &saveptr);
+
+	if (!namespace || !strlen(namespace) || !strlen(nsspec))
 		bail("ns paths are empty");
 
-	/*
-	 * We have to open the file descriptors first, since after
-	 * we join the mnt namespace we might no longer be able to
-	 * access the paths.
-	 */
 	do {
 		int fd;
 		char *path;
 		struct namespace_t *ns;
 
 		/* Resize the namespace array. */
-		namespaces = realloc(namespaces, ++num * sizeof(struct namespace_t));
+		namespaces = realloc(namespaces, ++len * sizeof(struct namespace_t));
 		if (!namespaces)
 			bail("failed to reallocate namespace array");
-		ns = &namespaces[num - 1];
+		ns = &namespaces[len - 1];
 
 		/* Split 'ns:path'. */
 		path = strstr(namespace, ":");
@@ -611,31 +496,146 @@ void join_namespaces(char *nslist)
 		strncpy(ns->type, namespace, PATH_MAX - 1);
 		strncpy(ns->path, path, PATH_MAX - 1);
 		ns->path[PATH_MAX - 1] = '\0';
+
+		ns_to_join |= nstype(ns->type);
 	} while ((namespace = strtok_r(NULL, ",", &saveptr)) != NULL);
 
-	/*
-	 * The ordering in which we join namespaces is important. We should
-	 * always join the user namespace *first*. This is all guaranteed
-	 * from the container_linux.go side of this, so we're just going to
-	 * follow the order given to us.
-	 */
-
-	for (i = 0; i < num; i++) {
-		struct namespace_t *ns = &namespaces[i];
-		int flag = nsflag(ns->type);
-
-		write_log(DEBUG, "setns(%#x) into %s namespace (with path %s)", flag, ns->type, ns->path);
-		if (setns(ns->fd, flag) < 0)
-			bail("failed to setns into %s namespace", ns->type);
-
-		close(ns->fd);
-	}
-
-	free(namespaces);
+	*ns_list = namespaces;
+	*ns_len = len;
+	return ns_to_join;
 }
 
-/* Defined in cloned_binary.c. */
-extern int ensure_cloned_binary(void);
+/*
+ * Try to join all namespaces that are in the "allow" nsset, and return the
+ * set we were able to successfully join. If a permission error is returned
+ * from nsset(2), the namespace is skipped (non-permission errors are fatal).
+ */
+static nsset_t __join_namespaces(nsset_t allow, struct namespace_t *ns_list, size_t ns_len)
+{
+	nsset_t joined = 0;
+
+	for (size_t i = 0; i < ns_len; i++) {
+		struct namespace_t *ns = &ns_list[i];
+		int type = nstype(ns->type);
+		int err, saved_errno;
+
+		if (!(type & allow))
+			continue;
+
+		err = setns(ns->fd, type);
+		saved_errno = errno;
+		write_log(DEBUG, "setns(%#x) into %s namespace (with path %s): %s",
+			  type, ns->type, ns->path, strerror(errno));
+		if (err < 0) {
+			/* Skip permission errors. */
+			if (saved_errno == EPERM)
+				continue;
+			bail("failed to setns into %s namespace", ns->type);
+		}
+		joined |= type;
+
+		/*
+		 * If we change user namespaces, make sure we switch to root in the
+		 * namespace (this matches the logic for unshare(CLONE_NEWUSER)), lots
+		 * of things can break if we aren't the right user. See
+		 * <https://github.com/opencontainers/runc/issues/4466> for one example.
+		 */
+		if (type == CLONE_NEWUSER) {
+			if (setresuid(0, 0, 0) < 0)
+				bail("failed to become root in user namespace");
+		}
+
+		close(ns->fd);
+		ns->fd = -1;
+	}
+	return joined;
+}
+
+static char *strappend(char *dst, char *src)
+{
+	if (!dst)
+		return strdup(src);
+
+	size_t len = strlen(dst) + strlen(src) + 1;
+	dst = realloc(dst, len);
+	strncat(dst, src, len);
+	return dst;
+}
+
+static char *nsset_to_str(nsset_t nsset)
+{
+	char *str = NULL;
+	for (struct nstype_t * ns = all_ns_types; ns->name != NULL; ns++) {
+		if (ns->type & nsset) {
+			if (str)
+				str = strappend(str, ", ");
+			str = strappend(str, ns->name);
+		}
+	}
+	return str ? : strdup("");
+}
+
+static void __close_namespaces(nsset_t to_join, nsset_t joined, struct namespace_t *ns_list, size_t ns_len)
+{
+	/* We expect to have joined every namespace. */
+	nsset_t failed_to_join = to_join & ~joined;
+
+	/* Double-check that we used up (and thus joined) all of the nsfds. */
+	for (size_t i = 0; i < ns_len; i++) {
+		struct namespace_t *ns = &ns_list[i];
+		int type = nstype(ns->type);
+
+		if (ns->fd < 0)
+			continue;
+
+		failed_to_join |= type;
+		write_log(FATAL, "failed to setns(%#x) into %s namespace (with path %s): %s",
+			  type, ns->type, ns->path, strerror(EPERM));
+		close(ns->fd);
+		ns->fd = -1;
+	}
+
+	/* Make sure we joined the namespaces we planned to. */
+	if (failed_to_join)
+		bail("failed to join {%s} namespaces: %s", nsset_to_str(failed_to_join), strerror(EPERM));
+
+	free(ns_list);
+}
+
+void join_namespaces(char *nsspec)
+{
+	nsset_t to_join = 0, joined = 0;
+	struct namespace_t *ns_list;
+	size_t ns_len;
+
+	/*
+	 * We have to open the file descriptors first, since after we join the
+	 * mnt or user namespaces we might no longer be able to access the
+	 * paths.
+	 */
+	to_join = __open_namespaces(nsspec, &ns_list, &ns_len);
+
+	/*
+	 * We first try to join all non-userns namespaces to join any namespaces
+	 * that we might not be able to join once we switch credentials to the
+	 * container's userns. We then join the user namespace, and then try to
+	 * join any remaining namespaces (this last step is needed for rootless
+	 * containers -- we don't get setns(2) permissions until we join the userns
+	 * and get CAP_SYS_ADMIN).
+	 *
+	 * Splitting the joins this way is necessary for containers that are
+	 * configured to join some externally-created namespace but are also
+	 * configured to join an unrelated user namespace.
+	 *
+	 * This is similar to what nsenter(1) seems to do in practice.
+	 */
+	joined |= __join_namespaces(to_join & ~(joined | CLONE_NEWUSER), ns_list, ns_len);
+	joined |= __join_namespaces(CLONE_NEWUSER, ns_list, ns_len);
+	joined |= __join_namespaces(to_join & ~(joined | CLONE_NEWUSER), ns_list, ns_len);
+
+	/* Verify that we joined all of the namespaces. */
+	__close_namespaces(to_join, joined, ns_list, ns_len);
+}
 
 static inline int sane_kill(pid_t pid, int signum)
 {
@@ -645,192 +645,32 @@ static inline int sane_kill(pid_t pid, int signum)
 		return 0;
 }
 
-void receive_fd(int sockfd, int new_fd)
+void try_unshare(int flags, const char *msg)
 {
-	int bytes_read;
-	struct msghdr msg = { };
-	struct cmsghdr *cmsg;
-	struct iovec iov = { };
-	char null_byte = '\0';
-	int ret;
-	int fd_count;
-	int *fd_payload;
-
-	iov.iov_base = &null_byte;
-	iov.iov_len = 1;
-
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-
-	msg.msg_controllen = CMSG_SPACE(sizeof(int));
-	msg.msg_control = malloc(msg.msg_controllen);
-	if (msg.msg_control == NULL) {
-		bail("Can't allocate memory to receive fd.");
+	write_log(DEBUG, "unshare %s", msg);
+	/*
+	 * Kernels prior to v4.3 may return EINVAL on unshare when another process
+	 * reads runc's /proc/$PID/status or /proc/$PID/maps. To work around this,
+	 * retry on EINVAL a few times.
+	 */
+	int retries = 5;
+	for (; retries > 0; retries--) {
+		if (unshare(flags) == 0) {
+			return;
+		}
+		if (errno != EINVAL)
+			break;
 	}
-
-	memset(msg.msg_control, 0, msg.msg_controllen);
-
-	bytes_read = recvmsg(sockfd, &msg, 0);
-	if (bytes_read != 1)
-		bail("failed to receive fd from unix socket %d", sockfd);
-	if (msg.msg_flags & MSG_CTRUNC)
-		bail("received truncated control message from unix socket %d", sockfd);
-
-	cmsg = CMSG_FIRSTHDR(&msg);
-	if (!cmsg)
-		bail("received message from unix socket %d without control message", sockfd);
-
-	if (cmsg->cmsg_level != SOL_SOCKET)
-		bail("received unknown control message from unix socket %d: cmsg_level=%d", sockfd, cmsg->cmsg_level);
-
-	if (cmsg->cmsg_type != SCM_RIGHTS)
-		bail("received unknown control message from unix socket %d: cmsg_type=%d", sockfd, cmsg->cmsg_type);
-
-	fd_count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-	if (fd_count != 1)
-		bail("received control message from unix socket %d with too many fds: %d", sockfd, fd_count);
-
-	fd_payload = (int *)CMSG_DATA(cmsg);
-	ret = dup3(*fd_payload, new_fd, O_CLOEXEC);
-	if (ret < 0)
-		bail("cannot dup3 fd %d to %d", *fd_payload, new_fd);
-
-	free(msg.msg_control);
-
-	ret = close(*fd_payload);
-	if (ret < 0)
-		bail("cannot close fd %d", *fd_payload);
+	bail("failed to unshare %s", msg);
 }
 
-void send_fd(int sockfd, int fd)
+static void update_timens_offsets(pid_t pid, char *map, size_t map_len)
 {
-	int bytes_written;
-	struct msghdr msg = { };
-	struct cmsghdr *cmsg;
-	struct iovec iov[1] = { };
-	char null_byte = '\0';
-
-	iov[0].iov_base = &null_byte;
-	iov[0].iov_len = 1;
-
-	msg.msg_iov = iov;
-	msg.msg_iovlen = 1;
-
-	/* We send only one fd as specified by cmsg->cmsg_len below, even
-	 * though msg.msg_controllen might have more space due to alignment. */
-	msg.msg_controllen = CMSG_SPACE(sizeof(int));
-	msg.msg_control = malloc(msg.msg_controllen);
-	if (msg.msg_control == NULL) {
-		bail("Can't allocate memory to send fd.");
-	}
-
-	memset(msg.msg_control, 0, msg.msg_controllen);
-
-	cmsg = CMSG_FIRSTHDR(&msg);
-	cmsg->cmsg_level = SOL_SOCKET;
-	cmsg->cmsg_type = SCM_RIGHTS;
-	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-	memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
-
-	bytes_written = sendmsg(sockfd, &msg, 0);
-
-	free(msg.msg_control);
-
-	if (bytes_written != 1)
-		bail("failed to send fd %d via unix socket %d", fd, sockfd);
-}
-
-void receive_mountsources(int sockfd)
-{
-	char *mount_fds, *endp;
-	long new_fd;
-
-	// This env var must be a json array of ints.
-	mount_fds = getenv("_LIBCONTAINER_MOUNT_FDS");
-
-	if (mount_fds[0] != '[') {
-		bail("malformed _LIBCONTAINER_MOUNT_FDS env var: missing '['");
-	}
-	mount_fds++;
-
-	for (endp = mount_fds; *endp != ']'; mount_fds = endp + 1) {
-		new_fd = strtol(mount_fds, &endp, 10);
-		if (endp == mount_fds) {
-			bail("malformed _LIBCONTAINER_MOUNT_FDS env var: not a number");
-		}
-		if (*endp == '\0') {
-			bail("malformed _LIBCONTAINER_MOUNT_FDS env var: missing ]");
-		}
-		// The list contains -1 when no fd is needed. Ignore them.
-		if (new_fd == -1) {
-			continue;
-		}
-
-		if (new_fd == LONG_MAX || new_fd < 0 || new_fd > INT_MAX) {
-			bail("malformed _LIBCONTAINER_MOUNT_FDS env var: fds out of range");
-		}
-
-		receive_fd(sockfd, new_fd);
-	}
-}
-
-void send_mountsources(int sockfd, pid_t child, char *mountsources, size_t mountsources_len)
-{
-	char proc_path[PATH_MAX];
-	int host_mntns_fd;
-	int container_mntns_fd;
-	int fd;
-	int ret;
-
-	// container_linux.go shouldSendMountSources() decides if mount sources
-	// should be pre-opened (O_PATH) and passed via SCM_RIGHTS
-	if (mountsources == NULL)
+	if (map == NULL || map_len == 0)
 		return;
-
-	host_mntns_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
-	if (host_mntns_fd == -1)
-		bail("failed to get current mount namespace");
-
-	if (snprintf(proc_path, PATH_MAX, "/proc/%d/ns/mnt", child) < 0)
-		bail("failed to get mount namespace path");
-
-	container_mntns_fd = open(proc_path, O_RDONLY | O_CLOEXEC);
-	if (container_mntns_fd == -1)
-		bail("failed to get container mount namespace");
-
-	if (setns(container_mntns_fd, CLONE_NEWNS) < 0)
-		bail("failed to setns to container mntns");
-
-	char *mountsources_end = mountsources + mountsources_len;
-	while (mountsources < mountsources_end) {
-		if (mountsources[0] == '\0') {
-			mountsources++;
-			continue;
-		}
-
-		fd = open(mountsources, O_PATH | O_CLOEXEC);
-		if (fd < 0)
-			bail("failed to open mount source %s", mountsources);
-
-		write_log(DEBUG, "~> sending fd for: %s", mountsources);
-		send_fd(sockfd, fd);
-
-		ret = close(fd);
-		if (ret != 0)
-			bail("failed to close mount source fd %d", fd);
-
-		mountsources += strlen(mountsources) + 1;
-	}
-
-	if (setns(host_mntns_fd, CLONE_NEWNS) < 0)
-		bail("failed to setns to host mntns");
-
-	ret = close(host_mntns_fd);
-	if (ret != 0)
-		bail("failed to close host mount namespace fd %d", host_mntns_fd);
-	ret = close(container_mntns_fd);
-	if (ret != 0)
-		bail("failed to close container mount namespace fd %d", container_mntns_fd);
+	write_log(DEBUG, "update /proc/%d/timens_offsets to '%s'", pid, map);
+	if (write_file(map, map_len, "/proc/%d/timens_offsets", pid) < 0)
+		bail("failed to update /proc/%d/timens_offsets", pid);
 }
 
 void nsexec(void)
@@ -856,21 +696,6 @@ void nsexec(void)
 		/* We are not a runc init. Just return to go runtime. */
 		return;
 	}
-
-	/*
-	 * We need to re-exec if we are not in a cloned binary. This is necessary
-	 * to ensure that containers won't be able to access the host binary
-	 * through /proc/self/exe. See CVE-2019-5736.
-	 */
-	if (ensure_cloned_binary() < 0)
-		bail("could not ensure we are a cloned binary");
-
-	/*
-	 * Inform the parent we're past initial setup.
-	 * For the other side of this, see initWaiter.
-	 */
-	if (write(pipenum, "", 1) != 1)
-		bail("could not inform the parent we are past initial setup");
 
 	write_log(DEBUG, "=> nsexec container setup");
 
@@ -961,8 +786,7 @@ void nsexec(void)
 	 * -- Aleksa "what has my life come to?" Sarai
 	 */
 
-	current_stage = setjmp(env);
-	switch (current_stage) {
+	switch (setjmp(env)) {
 		/*
 		 * Stage 0: We're in the parent. Our job is just to create a new child
 		 *          (stage 1: STAGE_CHILD) process and write its uid_map and
@@ -976,6 +800,7 @@ void nsexec(void)
 			bool stage1_complete, stage2_complete;
 
 			/* For debugging. */
+			current_stage = STAGE_PARENT;
 			prctl(PR_SET_NAME, (unsigned long)"runc:[0:PARENT]", 0, 0, 0);
 			write_log(DEBUG, "~> nsexec stage-0");
 
@@ -1064,15 +889,13 @@ void nsexec(void)
 						bail("failed to sync with runc: write(pid-JSON)");
 					}
 					break;
-				case SYNC_MOUNTSOURCES_PLS:
-					write_log(DEBUG, "stage-1 requested to open mount sources");
-					send_mountsources(syncfd, stage1_pid, config.mountsources,
-							  config.mountsources_len);
-
-					s = SYNC_MOUNTSOURCES_ACK;
+				case SYNC_TIMEOFFSETS_PLS:
+					write_log(DEBUG, "stage-1 requested timens offsets to be configured");
+					update_timens_offsets(stage1_pid, config.timensoffset, config.timensoffset_len);
+					s = SYNC_TIMEOFFSETS_ACK;
 					if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
 						sane_kill(stage1_pid, SIGKILL);
-						bail("failed to sync with child: write(SYNC_MOUNTSOURCES_ACK)");
+						bail("failed to sync with child: write(SYNC_TIMEOFFSETS_ACK)");
 					}
 					break;
 				case SYNC_CHILD_FINISH:
@@ -1133,6 +956,9 @@ void nsexec(void)
 			pid_t stage2_pid = -1;
 			enum sync_t s;
 
+			/* For debugging. */
+			current_stage = STAGE_CHILD;
+
 			/* We're in a child and thus need to tell the parent if we die. */
 			syncfd = sync_child_pipe[0];
 			if (close(sync_child_pipe[1]) < 0)
@@ -1171,9 +997,7 @@ void nsexec(void)
 			 * problem.
 			 */
 			if (config.cloneflags & CLONE_NEWUSER) {
-				write_log(DEBUG, "unshare user namespace");
-				if (unshare(CLONE_NEWUSER) < 0)
-					bail("failed to unshare user namespace");
+				try_unshare(CLONE_NEWUSER, "user namespace");
 				config.cloneflags &= ~CLONE_NEWUSER;
 
 				/*
@@ -1197,7 +1021,7 @@ void nsexec(void)
 					bail("failed to sync with parent: write(SYNC_USERMAP_PLS)");
 
 				/* ... wait for mapping ... */
-				write_log(DEBUG, "request stage-0 to map user namespace");
+				write_log(DEBUG, "waiting stage-0 to complete the mapping of user namespace");
 				if (read(syncfd, &s, sizeof(s)) != sizeof(s))
 					bail("failed to sync with parent: read(SYNC_USERMAP_ACK)");
 				if (s != SYNC_USERMAP_ACK)
@@ -1225,25 +1049,19 @@ void nsexec(void)
 			 * some old kernel versions where clone(CLONE_PARENT | CLONE_NEWPID)
 			 * was broken, so we'll just do it the long way anyway.
 			 */
-			write_log(DEBUG, "unshare remaining namespace (except cgroupns)");
-			if (unshare(config.cloneflags & ~CLONE_NEWCGROUP) < 0)
-				bail("failed to unshare remaining namespaces (except cgroupns)");
+			try_unshare(config.cloneflags, "remaining namespaces");
 
-			/* Ask our parent to send the mount sources fds. */
-			if (config.mountsources) {
-				write_log(DEBUG, "request stage-0 to send mount sources");
-				s = SYNC_MOUNTSOURCES_PLS;
+			if (config.timensoffset) {
+				write_log(DEBUG, "request stage-0 to write timens offsets");
+
+				s = SYNC_TIMEOFFSETS_PLS;
 				if (write(syncfd, &s, sizeof(s)) != sizeof(s))
-					bail("failed to sync with parent: write(SYNC_MOUNTSOURCES_PLS)");
+					bail("failed to sync with parent: write(SYNC_TIMEOFFSETS_PLS)");
 
-				/* Receive and install all mount sources fds. */
-				receive_mountsources(syncfd);
-
-				/* Parent finished to send the mount sources fds. */
 				if (read(syncfd, &s, sizeof(s)) != sizeof(s))
-					bail("failed to sync with parent: read(SYNC_MOUNTSOURCES_ACK)");
-				if (s != SYNC_MOUNTSOURCES_ACK)
-					bail("failed to sync with parent: SYNC_MOUNTSOURCES_ACK: got %u", s);
+					bail("failed to sync with parent: read(SYNC_TIMEOFFSETS_ACK)");
+				if (s != SYNC_TIMEOFFSETS_ACK)
+					bail("failed to sync with parent: SYNC_TIMEOFFSETS_ACK: got %u", s);
 			}
 
 			/*
@@ -1308,6 +1126,9 @@ void nsexec(void)
 			 */
 			enum sync_t s;
 
+			/* For debugging. */
+			current_stage = STAGE_INIT;
+
 			/* We're in a child and thus need to tell the parent if we die. */
 			syncfd = sync_grandchild_pipe[0];
 			if (close(sync_grandchild_pipe[1]) < 0)
@@ -1339,11 +1160,6 @@ void nsexec(void)
 					bail("setgroups failed");
 			}
 
-			if (config.cloneflags & CLONE_NEWCGROUP) {
-				if (unshare(CLONE_NEWCGROUP) < 0)
-					bail("failed to unshare cgroup namespace");
-			}
-
 			write_log(DEBUG, "signal completion to stage-0");
 			s = SYNC_CHILD_FINISH;
 			if (write(syncfd, &s, sizeof(s)) != sizeof(s))
@@ -1363,7 +1179,7 @@ void nsexec(void)
 		}
 		break;
 	default:
-		bail("unknown stage '%d' for jump value", current_stage);
+		bail("unexpected jump value");
 	}
 
 	/* Should never be reached. */

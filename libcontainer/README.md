@@ -8,11 +8,13 @@ It allows you to manage the lifecycle of the container performing additional ope
 after the container is created.
 
 
-#### Container
+## Container
 A container is a self contained execution environment that shares the kernel of the
 host system and which is (optionally) isolated from other containers in the system.
 
-#### Using libcontainer
+## Using libcontainer
+
+### Container init
 
 Because containers are spawned in a two step process you will need a binary that
 will be executed as the init process for the container. In libcontainer, we use
@@ -23,24 +25,28 @@ function as the entry of "bootstrap".
 In addition to the go init function the early stage bootstrap is handled by importing
 [nsenter](https://github.com/opencontainers/runc/blob/master/libcontainer/nsenter/README.md).
 
-```go
-import (
-	_ "github.com/opencontainers/runc/libcontainer/nsenter"
-)
+For details on how runc implements such "init", see
+[init.go](https://github.com/opencontainers/runc/blob/master/init.go)
+and [libcontainer/init_linux.go](https://github.com/opencontainers/runc/blob/master/libcontainer/init_linux.go).
 
-func init() {
-	if len(os.Args) > 1 && os.Args[1] == "init" {
-		runtime.GOMAXPROCS(1)
-		runtime.LockOSThread()
-		if err := libcontainer.StartInitialization(); err != nil {
-			logrus.Fatal(err)
-		}
-		panic("--this line should have never been executed, congratulations--")
-	}
-}
+### Device management
+
+If you want containers that have access to some devices, you need to import
+this package into your code:
+
+```go
+    import (
+        _ "github.com/opencontainers/runc/libcontainer/cgroups/devices"
+    )
 ```
 
-Then to create a container you first have to create a configuration
+Without doing this, libcontainer cgroup manager won't be able to set up device
+access rules, and will fail if devices are specified in the container
+configuration.
+
+### Container creation
+
+To create a container you first have to create a configuration
 struct describing how the container is to be created. A sample would look similar to this:
 
 ```go
@@ -53,66 +59,14 @@ config := &configs.Config{
 	Rootfs: "/your/path/to/rootfs",
 	Capabilities: &configs.Capabilities{
 		Bounding: []string{
-			"CAP_CHOWN",
-			"CAP_DAC_OVERRIDE",
-			"CAP_FSETID",
-			"CAP_FOWNER",
-			"CAP_MKNOD",
-			"CAP_NET_RAW",
-			"CAP_SETGID",
-			"CAP_SETUID",
-			"CAP_SETFCAP",
-			"CAP_SETPCAP",
-			"CAP_NET_BIND_SERVICE",
-			"CAP_SYS_CHROOT",
 			"CAP_KILL",
 			"CAP_AUDIT_WRITE",
 		},
 		Effective: []string{
-			"CAP_CHOWN",
-			"CAP_DAC_OVERRIDE",
-			"CAP_FSETID",
-			"CAP_FOWNER",
-			"CAP_MKNOD",
-			"CAP_NET_RAW",
-			"CAP_SETGID",
-			"CAP_SETUID",
-			"CAP_SETFCAP",
-			"CAP_SETPCAP",
-			"CAP_NET_BIND_SERVICE",
-			"CAP_SYS_CHROOT",
 			"CAP_KILL",
 			"CAP_AUDIT_WRITE",
 		},
 		Permitted: []string{
-			"CAP_CHOWN",
-			"CAP_DAC_OVERRIDE",
-			"CAP_FSETID",
-			"CAP_FOWNER",
-			"CAP_MKNOD",
-			"CAP_NET_RAW",
-			"CAP_SETGID",
-			"CAP_SETUID",
-			"CAP_SETFCAP",
-			"CAP_SETPCAP",
-			"CAP_NET_BIND_SERVICE",
-			"CAP_SYS_CHROOT",
-			"CAP_KILL",
-			"CAP_AUDIT_WRITE",
-		},
-		Ambient: []string{
-			"CAP_CHOWN",
-			"CAP_DAC_OVERRIDE",
-			"CAP_FSETID",
-			"CAP_FOWNER",
-			"CAP_MKNOD",
-			"CAP_NET_RAW",
-			"CAP_SETGID",
-			"CAP_SETUID",
-			"CAP_SETFCAP",
-			"CAP_SETPCAP",
-			"CAP_NET_BIND_SERVICE",
-			"CAP_SYS_CHROOT",
 			"CAP_KILL",
 			"CAP_AUDIT_WRITE",
 		},
@@ -184,14 +138,14 @@ config := &configs.Config{
 			Flags:       defaultMountFlags | unix.MS_RDONLY,
 		},
 	},
-	UidMappings: []configs.IDMap{
+	UIDMappings: []configs.IDMap{
 		{
 			ContainerID: 0,
 			HostID: 1000,
 			Size: 65536,
 		},
 	},
-	GidMappings: []configs.IDMap{
+	GIDMappings: []configs.IDMap{
 		{
 			ContainerID: 0,
 			HostID: 1000,
@@ -287,7 +241,7 @@ state, err := container.State()
 ```
 
 
-#### Checkpoint & Restore
+## Checkpoint & Restore
 
 libcontainer now integrates [CRIU](http://criu.org/) for checkpointing and restoring containers.
 This lets you save the state of a process running inside a container to disk, and then restore

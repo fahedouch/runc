@@ -38,10 +38,6 @@ function setup() {
 		MEM_SWAP="memory.memsw.limit_in_bytes"
 		SD_MEM_SWAP="unsupported"
 		SYSTEM_MEM=$(cat "${CGROUP_MEMORY_BASE_PATH}/${MEM_LIMIT}")
-		HAVE_SWAP="no"
-		if [ -f "${CGROUP_MEMORY_BASE_PATH}/${MEM_SWAP}" ]; then
-			HAVE_SWAP="yes"
-		fi
 	else
 		MEM_LIMIT="memory.max"
 		SD_MEM_LIMIT="MemoryMax"
@@ -50,8 +46,10 @@ function setup() {
 		MEM_SWAP="memory.swap.max"
 		SD_MEM_SWAP="MemorySwapMax"
 		SYSTEM_MEM="max"
-		HAVE_SWAP="yes"
 	fi
+
+	unset HAVE_SWAP
+	get_cgroup_value $MEM_SWAP >/dev/null && HAVE_SWAP=yes
 
 	SD_UNLIMITED="infinity"
 	SD_VERSION=$(systemctl --version | awk '{print $2; exit}')
@@ -94,13 +92,13 @@ function setup() {
 	check_cgroup_value "$MEM_RESERVE" 33554432
 	check_systemd_value "$SD_MEM_RESERVE" 33554432
 
-	# Run swap memory tests if swap is available
-	if [ "$HAVE_SWAP" = "yes" ]; then
+	# Run swap memory tests if swap is available.
+	if [ -v HAVE_SWAP ]; then
 		# try to remove memory swap limit
 		runc update test_update --memory-swap -1
 		[ "$status" -eq 0 ]
-		check_cgroup_value "$MEM_SWAP" $SYSTEM_MEM
-		check_systemd_value "$SD_MEM_SWAP" $SD_UNLIMITED
+		check_cgroup_value "$MEM_SWAP" "$SYSTEM_MEM"
+		check_systemd_value "$SD_MEM_SWAP" "$SD_UNLIMITED"
 
 		# update memory swap
 		if [ -v CGROUP_V2 ]; then
@@ -123,13 +121,13 @@ function setup() {
 	[ "$status" -eq 0 ]
 
 	# check memory limit is gone
-	check_cgroup_value $MEM_LIMIT $SYSTEM_MEM
-	check_systemd_value $SD_MEM_LIMIT $SD_UNLIMITED
+	check_cgroup_value "$MEM_LIMIT" "$SYSTEM_MEM"
+	check_systemd_value "$SD_MEM_LIMIT" "$SD_UNLIMITED"
 
 	# check swap memory limited is gone
-	if [ "$HAVE_SWAP" = "yes" ]; then
-		check_cgroup_value $MEM_SWAP $SYSTEM_MEM
-		check_systemd_value "$SD_MEM_SWAP" $SD_UNLIMITED
+	if [ -v HAVE_SWAP ]; then
+		check_cgroup_value "$MEM_SWAP" "$SYSTEM_MEM"
+		check_systemd_value "$SD_MEM_SWAP" "$SD_UNLIMITED"
 	fi
 
 	# update pids limit
@@ -221,7 +219,7 @@ EOF
 	check_cgroup_value "pids.max" 20
 	check_systemd_value "TasksMax" 20
 
-	if [ "$HAVE_SWAP" = "yes" ]; then
+	if [ -v HAVE_SWAP ]; then
 		# Test case for https://github.com/opencontainers/runc/pull/592,
 		# checking libcontainer/cgroups/fs/memory.go:setMemoryAndSwap.
 
@@ -330,6 +328,31 @@ EOF
 	[ "$status" -eq 0 ]
 	check_cpu_quota 500000 1000000 "500ms"
 	check_cpu_shares 100
+}
+
+@test "cpu burst" {
+	[ $EUID -ne 0 ] && requires rootless_cgroup
+	requires cgroups_cpu_burst
+
+	runc run -d --console-socket "$CONSOLE_SOCKET" test_update
+	[ "$status" -eq 0 ]
+	check_cpu_burst 0
+
+	runc update test_update --cpu-period 900000 --cpu-burst 500000
+	[ "$status" -eq 0 ]
+	check_cpu_burst 500000
+
+	# issue: https://github.com/opencontainers/runc/issues/4210
+	# for systemd, cpu-burst value will be cleared, it's a known issue.
+	if [ ! -v RUNC_USE_SYSTEMD ]; then
+		runc update test_update --memory 100M
+		[ "$status" -eq 0 ]
+		check_cpu_burst 500000
+	fi
+
+	runc update test_update --cpu-period 900000 --cpu-burst 0
+	[ "$status" -eq 0 ]
+	check_cpu_burst 0
 }
 
 @test "set cpu period with no quota" {
@@ -454,10 +477,65 @@ EOF
 		check_cgroup_value "cpu.idle" "$val"
 	done
 
+	# Values other than 1 or 0 are ignored by the kernel, see
+	# sched_group_set_idle() in kernel/sched/fair.c.
+	#
+	# If this ever fails, it means that the kernel now accepts values
+	# other than 0 or 1, and runc needs to adopt.
+	for val in -1 2 3; do
+		runc update --cpu-idle "$val" test_update
+		[ "$status" -ne 0 ]
+		check_cgroup_value "cpu.idle" "1"
+	done
+
+	# https://github.com/opencontainers/runc/issues/3786
+	[ "$(systemd_version)" -ge 252 ] && return
 	# test update other option won't impact on cpu.idle
 	runc update --cpu-period 10000 test_update
 	[ "$status" -eq 0 ]
 	check_cgroup_value "cpu.idle" "1"
+}
+
+@test "update cgroup cpu.idle via systemd v252+" {
+	requires cgroups_v2 systemd_v252 cgroups_cpu_idle
+	[ $EUID -ne 0 ] && requires rootless_cgroup
+
+	runc run -d --console-socket "$CONSOLE_SOCKET" test_update
+	[ "$status" -eq 0 ]
+	check_cgroup_value "cpu.idle" "0"
+
+	# If cpu-idle is set, cpu-share (converted to CPUWeight) can't be set via systemd.
+	runc update --cpu-share 200 --cpu-idle 1 test_update
+	[[ "$output" == *"unable to apply both"* ]]
+	check_cgroup_value "cpu.idle" "1"
+
+	# Changing cpu-shares (converted to CPU weight) resets cpu.idle to 0.
+	runc update --cpu-share 200 test_update
+	check_cgroup_value "cpu.idle" "0"
+
+	# Setting values via unified map.
+
+	# If cpu.idle is set, cpu.weight is ignored.
+	runc update -r - test_update <<EOF
+{
+  "unified": {
+    "cpu.idle": "1",
+    "cpu.weight": "8"
+  }
+}
+EOF
+	[[ "$output" == *"unable to apply both"* ]]
+	check_cgroup_value "cpu.idle" "1"
+
+	# Setting any cpu.weight should reset cpu.idle to 0.
+	runc update -r - test_update <<EOF
+{
+  "unified": {
+    "cpu.weight": "8"
+  }
+}
+EOF
+	check_cgroup_value "cpu.idle" "0"
 }
 
 @test "update cgroup v2 resources via unified map" {
@@ -686,6 +764,17 @@ EOF
 
 	check_cgroup_value "cpu.rt_period_us" 900001
 	check_cgroup_value "cpu.rt_runtime_us" 600001
+
+	# https://github.com/opencontainers/runc/issues/4094
+	runc update test_update_rt --cpu-rt-period 10000 --cpu-rt-runtime 3000
+	[ "$status" -eq 0 ]
+	check_cgroup_value "cpu.rt_period_us" 10000
+	check_cgroup_value "cpu.rt_runtime_us" 3000
+
+	runc update test_update_rt --cpu-rt-period 100000 --cpu-rt-runtime 20000
+	[ "$status" -eq 0 ]
+	check_cgroup_value "cpu.rt_period_us" 100000
+	check_cgroup_value "cpu.rt_runtime_us" 20000
 }
 
 @test "update devices [minimal transition rules]" {
@@ -712,7 +801,7 @@ EOF
 	TMP_RECVTTY_PID="$TMP_RECVTTY_DIR/recvtty.pid"
 	TMP_CONSOLE_SOCKET="$TMP_RECVTTY_DIR/console.sock"
 	CONTAINER_OUTPUT="$TMP_RECVTTY_DIR/output"
-	("$RECVTTY" --no-stdin --pid-file "$TMP_RECVTTY_PID" \
+	("$TESTBINDIR/recvtty" --no-stdin --pid-file "$TMP_RECVTTY_PID" \
 		--mode single "$TMP_CONSOLE_SOCKET" &>"$CONTAINER_OUTPUT") &
 	retry 10 0.1 [ -e "$TMP_CONSOLE_SOCKET" ]
 
@@ -763,6 +852,8 @@ EOF
 }
 
 @test "update memory vs CheckBeforeUpdate" {
+	exclude_os almalinux-9.4 # See https://github.com/opencontainers/runc/issues/4454
+
 	requires cgroups_v2
 	[ $EUID -ne 0 ] && requires rootless_cgroup
 
@@ -799,5 +890,5 @@ EOF
 	# The container will be OOM killed, and runc might either succeed
 	# or fail depending on the timing, so we don't check its exit code.
 	runc update test_update --memory 1024
-	testcontainer test_update stopped
+	wait_for_container 10 1 test_update stopped
 }

@@ -6,17 +6,274 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### libcontainer API
+ * `configs.CommandHook` struct has changed, Command is now a pointer.
+   Also, `configs.NewCommandHook` now accepts a `*Command`. (#4325)
+ * The `Process` struct has `User` string field replaced with numeric
+   `UID` and `GID` fields, and `AdditionalGroups` changed its type from
+   `[]string` to `[]int`. Essentially, resolution of user and group
+   names to IDs is no longer performed by libcontainer, so if a libcontainer
+   user previously relied on this feature, now they have to convert names to
+   IDs before calling libcontainer; it is recommended to use Go package
+   github.com/moby/sys/user for that. (#3999)
+
+## [1.2.0] - 2024-10-22
+
+> できるときにできることをやるんだ。それが今だ。
+
+### Added
+ * In order to alleviate the remaining concerns around the memory usage and
+   (arguably somewhat unimportant, but measurable) performance overhead of
+   memfds for cloning `/proc/self/exe`, we have added a new protection using
+   `overlayfs` that is used if you have enough privileges and the running
+   kernel supports it. It has effectively no performance nor memory overhead
+   (compared to no cloning at all). (#4448)
+
+### Fixed
+ * The original fix for [CVE-2024-45310][cve-2024-45310] was intentionally very
+   limited in scope to make it easier to review, however it also did not handle
+   all possible `os.MkdirAll` cases and thus could lead to regressions. We have
+   switched to the more complete implementation in the newer versions of
+   `github.com/cyphar/filepath-securejoin`. (#4393, #4400, #4421, #4430)
+ * In certain situations (a system with lots of mounts or racing mounts) we
+   could accidentally end up leaking mounts from the container into the host.
+   This has been fixed. (#4417)
+ * The fallback logic for `O_TMPFILE` clones of `/proc/self/exe` had a minor
+   bug that would cause us to miss non-`noexec` directories and thus fail to
+   start containers on some systems. (#4444)
+ * Sometimes the cloned `/proc/self/exe` file descriptor could be placed in a
+   way that it would get clobbered by the Go runtime. We had a fix for this
+   already but it turns out it could still break in rare circumstances, but it
+   has now been fixed. (#4294, #4452)
+
+### Changed
+ * It is not possible for `runc kill` to work properly in some specific
+   configurations (such as rootless containers with no cgroups and a shared pid
+   namespace). We now output a warning for such configurations. (#4398)
+ * memfd-bind: update the documentation and make path handling with the systemd
+   unit more idiomatic. (#4428)
+ * We now use v0.16 of Cilium's eBPF library, including fixes that quite a few
+   downstreams asked for. (#4397, #4396)
+ * Some internal `runc init` synchronisation that was no longer necessary (due
+   to the `/proc/self/exe` cloning move to Go) was removed. (#4441)
+
+[cve-2024-45310]: https://github.com/opencontainers/runc/security/advisories/GHSA-jfvp-7x6p-h2pv
+
+## [1.2.0-rc.3] - 2024-09-02
+
+> The supreme happiness of life is the conviction that we are loved.
+
+### Security
+
+ * Fix [CVE-2024-45310][cve-2024-45310], a low-severity attack that allowed
+   maliciously configured containers to create empty files and directories on
+   the host.
+
+### Added
+
+ * Document build prerequisites for different platforms. (#4353)
+
+### Fixed
+
+ * Try to delete exec fifo file when failure in creation. (#4319)
+ * Revert "libcontainer: seccomp: pass around *os.File for notifyfd". (#4337)
+ * Fix link to gvariant documentation in systemd docs. (#4369)
+
+### Changed
+
+ * Remove pre-go1.17 build-tags. (#4329)
+ * libct/userns: assorted (godoc) improvements. (#4330)
+ * libct/userns: split userns detection from internal userns code. (#4331)
+ * rootfs: consolidate mountpoint creation logic. (#4359)
+ * Add Go 1.23, drop 1.21. (#4360)
+ * Revert "allow overriding VERSION value in Makefile" and add `EXTRA_VERSION`.
+   (#4370)
+ * Mv contrib/cmd tests/cmd (except memfd-bind). (#4377)
+ * Makefile: Don't read COMMIT, BUILDTAGS, `EXTRA_BUILDTAGS` from env vars.
+   (#4380)
+
+[cve-2024-45310]: https://github.com/opencontainers/runc/security/advisories/GHSA-jfvp-7x6p-h2pv
+
+## [1.2.0-rc.2] - 2024-06-26
+
+> TRUE or FALSE, it's a problem!
+
+### Important Notes
+
+ * libcontainer/cgroups users who want to manage cgroup devices need to explicitly
+   import libcontainer/cgroups/devices. (#3452, #4248)
+ * If building with Go 1.22.x, make sure to use 1.22.4 or a later version.
+   (see #4233 for more details)
+
+### Added
+
+ * CI: add actuated-arm64. (#4142, #4252, #4276)
+
+### Fixed
+
+ * cgroup v2: do not set swap to 0 or unlimited when it's not available. (#4188)
+ * Set the default value of CpuBurst to nil instead of 0. (#4210, #4211)
+ * libct/cg: write unified resources line by line. (#4186)
+ * libct.Start: fix locking, do not allow a second container init. (#4271)
+ * Fix tests in debian testing (mount_sshfs.bats). (#4245)
+ * Fix codespell warnings. (#4291)
+ * libct/cg/dev: fix TestSetV1Allow panic. (#4295)
+ * tests/int/scheduler: require smp. (#4298)
+
+### Changed
+
+ * libct/cg/fs: don't write cpu_burst twice on ENOENT. (#4259)
+ * Make trimpath optional. (#3908)
+ * Remove unused system.Execv. (#4268)
+ * Stop blacklisting Go 1.22+, drop Go < 1.21 support, use Go 1.22 in CI. (#4292)
+ * Improve some error messages for runc exec. (#4320)
+ * ci/gha: bump golangci-lint[-action]. (#4255)
+ * tests/int/tty: increase the timeout. (#4260)
+ * [ci] use go mod instead of go get in spec.bats. (#4264)
+ * tests/int/checkpoint: rm double logging. (#4251)
+ * .cirrus.yml: rm FIXME from rootless fs on CentOS 7. (#4279)
+ * Dockerfile: bump Debian to 12, Go to 1.21. (#4296)
+ * ci/gha: switch to ubuntu 24.04. (#4286)
+ * Vagrantfile.fedora: bump to F40. (#4285)
+
+## [1.2.0-rc.1] - 2024-04-03
+
+> There's a frood who really knows where his towel is.
+
+`runc` now requires a minimum of Go 1.20 to compile.
+
+> **NOTE**: runc currently will not work properly when compiled with Go 1.22 or
+> newer. This is due to some unfortunate glibc behaviour that Go 1.22
+> exacerbates in a way that results in containers not being able to start on
+> some systems. [See this issue for more information.][runc-4233]
+
+[runc-4233]: https://github.com/opencontainers/runc/issues/4233
+
+### Breaking
+
+ * Several aspects of how mount options work has been adjusted in a way that
+   could theoretically break users that have very strange mount option strings.
+   This was necessary to fix glaring issues in how mount options were being
+   treated. The key changes are:
+
+   - Mount options on bind-mounts that clear a mount flag are now always
+     applied. Previously, if a user requested a bind-mount with only clearing
+     options (such as `rw,exec,dev`) the options would be ignored and the
+     original bind-mount options would be set. Unfortunately this also means
+     that container configurations which specified only clearing mount options
+     will now actually get what they asked for, which could break existing
+     containers (though it seems unlikely that a user who requested a specific
+     mount option would consider it "broken" to get the mount options they
+     asked foruser who requested a specific mount option would consider it
+     "broken" to get the mount options they asked for). This also allows us to
+     silently add locked mount flags the user *did not explicitly request to be
+     cleared* in rootless mode, allowing for easier use of bind-mounts for
+     rootless containers. (#3967)
+
+   - Container configurations using bind-mounts with superblock mount flags
+     (i.e. filesystem-specific mount flags, referred to as "data" in
+     `mount(2)`, as opposed to VFS generic mount flags like `MS_NODEV`) will
+     now return an error. This is because superblock mount flags will also
+     affect the host mount (as the superblock is shared when bind-mounting),
+     which is obviously not acceptable. Previously, these flags were silently
+     ignored so this change simply tells users that runc cannot fulfil their
+     request rather than just ignoring it. (#3990)
+
+   If any of these changes cause problems in real-world workloads, please [open
+   an issue](https://github.com/opencontainers/runc/issues/new/choose) so we
+   can adjust the behaviour to avoid compatibility issues.
+
+### Added
+
+ * runc has been updated to OCI runtime-spec 1.2.0, and supports all Linux
+   features with a few minor exceptions. See
+   [`docs/spec-conformance.md`](https://github.com/opencontainers/runc/blob/v1.2.0-rc.1/docs/spec-conformance.md)
+   for more details.
+ * runc now supports id-mapped mounts for bind-mounts (with no restrictions on
+   the mapping used for each mount). Other mount types are not currently
+   supported. This feature requires `MOUNT_ATTR_IDMAP` kernel support (Linux
+   5.12 or newer) as well as kernel support for the underlying filesystem used
+   for the bind-mount. See [`mount_setattr(2)`][mount_setattr.2] for a list of
+   supported filesystems and other restrictions. (#3717, #3985, #3993)
+ * Two new mechanisms for reducing the memory usage of our protections against
+   [CVE-2019-5736][cve-2019-5736] have been introduced:
+   - `runc-dmz` is a minimal binary (~8K) which acts as an additional execve
+     stage, allowing us to only need to protect the smaller binary. It should
+     be noted that there have been several compatibility issues reported with
+     the usage of `runc-dmz` (namely related to capabilities and SELinux). As
+     such, this mechanism is **opt-in** and can be enabled by running `runc`
+     with the environment variable `RUNC_DMZ=true` (setting this environment
+     variable in `config.json` will have no effect). This feature can be
+     disabled at build time using the `runc_nodmz` build tag. (#3983, #3987)
+   - `contrib/memfd-bind` is a helper daemon which will bind-mount a memfd copy
+     of `/usr/bin/runc` on top of `/usr/bin/runc`. This entirely eliminates
+     per-container copies of the binary, but requires care to ensure that
+     upgrades to runc are handled properly, and requires a long-running daemon
+     (unfortunately memfds cannot be bind-mounted directly and thus require a
+     daemon to keep them alive). (#3987)
+ * runc will now use `cgroup.kill` if available to kill all processes in a
+   container (such as when doing `runc kill`). (#3135, #3825)
+ * Add support for setting the umask for `runc exec`. (#3661)
+ * libct/cg: support `SCHED_IDLE` for runc cgroupfs. (#3377)
+ * checkpoint/restore: implement `--manage-cgroups-mode=ignore`. (#3546)
+ * seccomp: refactor flags support; add flags to features, set `SPEC_ALLOW` by
+   default. (#3588)
+ * libct/cg/sd: use systemd v240+ new `MAJOR:*` syntax. (#3843)
+ * Support CFS bandwidth burst for CPU. (#3749, #3145)
+ * Support time namespaces. (#3876)
+ * Reduce the `runc` binary size by ~11% by updating
+   `github.com/checkpoint-restore/go-criu`. (#3652)
+ * Add `--pidfd-socket` to `runc run` and `runc exec` to allow for management
+   processes to receive a pidfd for the new process, allowing them to avoid pid
+   reuse attacks. (#4045)
+
+[mount_setattr.2]: https://man7.org/linux/man-pages/man2/mount_setattr.2.html
+[cve-2019-5736]: https://github.com/advisories/GHSA-gxmr-w5mj-v8hh
+
 ### Deprecated
 
  * `runc` option `--criu` is now ignored (with a warning), and the option will
    be removed entirely in a future release. Users who need a non-standard
    `criu` binary should rely on the standard way of looking up binaries in
    `$PATH`. (#3316)
+ * `runc kill` option `-a` is now deprecated. Previously, it had to be specified
+   to kill a container (with SIGKILL) which does not have its own private PID
+   namespace (so that runc would send SIGKILL to all processes). Now, this is
+   done automatically. (#3864, #3825)
+ * `github.com/opencontainers/runc/libcontainer/user` is now deprecated, please
+   use `github.com/moby/sys/user` instead. It will be removed in a future
+   release. (#4017)
 
 ### Changed
 
  * When Intel RDT feature is not available, its initialization is skipped,
    resulting in slightly faster `runc exec` and `runc run`. (#3306)
+ * `runc features` is no longer experimental. (#3861)
+ * libcontainer users that create and kill containers from a daemon process
+   (so that the container init is a child of that process) must now implement
+   a proper child reaper in case a container does not have its own private PID
+   namespace, as documented in `container.Signal`. (#3825)
+ * Sum `anon` and `file` from `memory.stat` for cgroupv2 root usage,
+   as the root does not have `memory.current` for cgroupv2.
+   This aligns cgroupv2 root usage more closely with cgroupv1 reporting.
+   Additionally, report root swap usage as sum of swap and memory usage,
+   aligned with v1 and existing non-root v2 reporting. (#3933)
+ * Add `swapOnlyUsage` in `MemoryStats`. This field reports swap-only usage.
+   For cgroupv1, `Usage` and `Failcnt` are set by subtracting memory usage
+   from memory+swap usage. For cgroupv2, `Usage`, `Limit`, and `MaxUsage`
+   are set. (#4010)
+ * libcontainer users that create and kill containers from a daemon process
+   (so that the container init is a child of that process) must now implement
+   a proper child reaper in case a container does not have its own private PID
+   namespace, as documented in `container.Signal`. (#3825)
+ * libcontainer: `container.Signal` no longer takes an `all` argument. Whether
+   or not it is necessary to kill all processes in the container individually
+   is now determined automatically. (#3825, #3885)
+ * seccomp: enable seccomp binary tree optimization. (#3405)
+ * `runc run`/`runc exec`: ignore SIGURG. (#3368)
+ * Remove tun/tap from the default device allowlist. (#3468)
+ * `runc --root non-existent-dir list` now reports an error for non-existent
+   root directory. (#3374)
 
 ### Fixed
 
@@ -26,7 +283,311 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    s390 and s390x. This solves the issue where syscalls the host kernel did not
    support would return `-EPERM` despite the existence of the `-ENOSYS` stub
    code (this was due to how s390x does syscall multiplexing). (#3474)
+ * Remove tun/tap from the default device rules. (#3468)
+ * specconv: avoid mapping "acl" to `MS_POSIXACL`. (#3739)
+ * libcontainer: fix private PID namespace detection when killing the
+   container. (#3866, #3825)
+ * systemd socket notification: fix race where runc exited before systemd
+   properly handled the `READY` notification. (#3291, #3293)
+ * The `-ENOSYS` seccomp stub is now always generated for the native
+   architecture that `runc` is running on. This is needed to work around some
+   arguably specification-incompliant behaviour from Docker on architectures
+   such as ppc64le, where the allowed architecture list is set to `null`. This
+   ensures that we always generate at least one `-ENOSYS` stub for the native
+   architecture even with these weird configs. (#4219)
 
+### Removed
+
+ * In order to fix performance issues in the "lightweight" bindfd protection
+   against [CVE-2019-5736][cve-2019-5736], the temporary `ro` bind-mount of
+   `/proc/self/exe` has been removed. runc now creates a binary copy in all
+   cases. See the above notes about `memfd-bind` and `runc-dmz` as well as
+   `contrib/cmd/memfd-bind/README.md` for more information about how this
+   (minor) change in memory usage can be further reduced. (#3987, #3599, #2532,
+   #3931)
+ * libct/cg: Remove `EnterPid` (a function with no users). (#3797)
+ * libcontainer: Remove `{Pre,Post}MountCmds` which were never used and are
+   obsoleted by more generic container hooks. (#3350)
+
+[cve-2019-5736]: https://github.com/advisories/GHSA-gxmr-w5mj-v8hh
+
+## [1.1.15] - 2024-10-07
+
+> How, dear sir, did you cross the flood? By not stopping, friend, and by not
+> straining I crossed the flood.
+
+### Fixed
+
+ * The `-ENOSYS` seccomp stub is now always generated for the native
+   architecture that `runc` is running on. This is needed to work around some
+   arguably specification-incompliant behaviour from Docker on architectures
+   such as ppc64le, where the allowed architecture list is set to `null`. This
+   ensures that we always generate at least one `-ENOSYS` stub for the native
+   architecture even with these weird configs. (#4391)
+ * On a system with older kernel, reading `/proc/self/mountinfo` may skip some
+   entries, as a consequence runc may not properly set mount propagation,
+   causing container mounts leak onto the host mount namespace. (#2404, #4425)
+
+### Removed
+
+ * In order to fix performance issues in the "lightweight" bindfd protection
+   against [CVE-2019-5736], the temporary `ro` bind-mount of `/proc/self/exe`
+   has been removed. runc now creates a binary copy in all cases. (#4392, #2532)
+
+[CVE-2019-5736]: https://www.openwall.com/lists/oss-security/2019/02/11/2
+
+## [1.1.14] - 2024-09-03
+
+> 年を取っていいことは、驚かなくなることね。
+
+### Security
+
+ * Fix [CVE-2024-45310][cve-2024-45310], a low-severity attack that allowed
+   maliciously configured containers to create empty files and directories on
+   the host.
+
+[cve-2024-45310]: https://github.com/opencontainers/runc/security/advisories/GHSA-jfvp-7x6p-h2pv
+
+### Added
+
+ * Add support for Go 1.23. (#4360, #4372)
+
+### Fixed
+
+ * Revert "allow overriding VERSION value in Makefile" and add `EXTRA_VERSION`.
+   (#4370, #4382)
+ * rootfs: consolidate mountpoint creation logic. (#4359)
+
+## [1.1.13] - 2024-06-13
+
+> There is no certainty in the world. This is the only certainty I have.
+
+### Important Notes
+
+ * If building with Go 1.22.x, make sure to use 1.22.4 or a later version.
+   (see #4233 for more details)
+
+### Fixed
+
+ * Support go 1.22.4+. (#4313)
+ * runc list: fix race with runc delete. (#4231)
+ * Fix set nofile rlimit error. (#4277, #4299)
+ * libct/cg/fs: fix setting rt_period vs rt_runtime. (#4284)
+ * Fix a debug msg for user ns in nsexec. (#4315)
+ * script/*: fix gpg usage wrt keyboxd. (#4316)
+ * CI fixes and misc backports. (#4241)
+ * Fix codespell warnings. (#4300)
+
+### Changed
+
+ * Silence security false positives from golang/net. (#4244)
+ * libcontainer: allow containers to make apps think fips is enabled/disabled for testing. (#4257)
+ * allow overriding VERSION value in Makefile. (#4270)
+ * Vagrantfile.fedora: bump Fedora to 39. (#4261)
+ * ci/cirrus: rm centos stream 8. (#4305, #4308)
+
+## [1.1.12] - 2024-01-31
+
+> Now you're thinking with Portals™!
+
+### Security
+
+* Fix [CVE-2024-21626][cve-2024-21626], a container breakout attack that took
+  advantage of a file descriptor that was leaked internally within runc (but
+  never leaked to the container process). In addition to fixing the leak,
+  several strict hardening measures were added to ensure that future internal
+  leaks could not be used to break out in this manner again. Based on our
+  research, while no other container runtime had a similar leak, none had any
+  of the hardening steps we've introduced (and some runtimes would not check
+  for any file descriptors that a calling process may have leaked to them,
+  allowing for container breakouts due to basic user error).
+
+[cve-2024-21626]: https://github.com/opencontainers/runc/security/advisories/GHSA-xr7r-f8xq-vfvv
+
+## [1.1.11] - 2024-01-01
+
+> Happy New Year!
+
+### Fixed
+
+* Fix several issues with userns path handling. (#4122, #4124, #4134, #4144)
+
+### Changed
+
+ * Support memory.peak and memory.swap.peak in cgroups v2.
+   Add `swapOnlyUsage` in `MemoryStats`. This field reports swap-only usage.
+   For cgroupv1, `Usage` and `Failcnt` are set by subtracting memory usage
+   from memory+swap usage. For cgroupv2, `Usage`, `Limit`, and `MaxUsage`
+   are set. (#4000, #4010, #4131)
+ * build(deps): bump github.com/cyphar/filepath-securejoin. (#4140)
+
+## [1.1.10] - 2023-10-31
+
+> Śruba, przykręcona we śnie, nie zmieni sytuacji, jaka panuje na jawie.
+
+### Added
+
+* Support for `hugetlb.<pagesize>.rsvd` limiting and accounting. Fixes the
+  issue of postres failing when hugepage limits are set. (#3859, #4077)
+
+### Fixed
+
+* Fixed permissions of a newly created directories to not depend on the value
+  of umask in tmpcopyup feature implementation. (#3991, #4060)
+* libcontainer: cgroup v1 GetStats now ignores missing `kmem.limit_in_bytes`
+  (fixes the compatibility with Linux kernel 6.1+). (#4028)
+* Fix a semi-arbitrary cgroup write bug when given a malicious hugetlb
+  configuration. This issue is not a security issue because it requires a
+  malicious `config.json`, which is outside of our threat model. (#4103)
+* Various CI fixes. (#4081, #4055)
+
+## [1.1.9] - 2023-08-10
+
+> There is a crack in everything. That's how the light gets in.
+
+### Added
+
+* Added go 1.21 to the CI matrix; other CI updates. (#3976, #3958)
+
+### Fixed
+
+* Fixed losing sticky bit on tmpfs (a regression in 1.1.8). (#3952, #3961)
+* intelrdt: fixed ignoring ClosID on some systems. (#3550, #3978)
+
+### Changed
+
+ * Sum `anon` and `file` from `memory.stat` for cgroupv2 root usage,
+   as the root does not have `memory.current` for cgroupv2.
+   This aligns cgroupv2 root usage more closely with cgroupv1 reporting.
+   Additionally, report root swap usage as sum of swap and memory usage,
+   aligned with v1 and existing non-root v2 reporting. (#3933)
+
+## [1.1.8] - 2023-07-20
+
+> 海纳百川 有容乃大
+
+### Added
+
+* Support riscv64. (#3905)
+
+### Fixed
+
+* init: do not print environment variable value. (#3879)
+* libct: fix a race with systemd removal. (#3877)
+* tests/int: increase num retries for oom tests. (#3891)
+* man/runc: fixes. (#3892)
+* Fix tmpfs mode opts when dir already exists. (#3916)
+* docs/systemd: fix a broken link. (#3917)
+* ci/cirrus: enable some rootless tests on cs9. (#3918)
+* runc delete: call systemd's reset-failed. (#3932)
+* libct/cg/sd/v1: do not update non-frozen cgroup after frozen failed. (#3921)
+
+### Changed
+
+* CI: bump Fedora, Vagrant, bats. (#3878)
+* `.codespellrc`: update for 2.2.5. (#3909)
+
+## [1.1.7] - 2023-04-26
+
+> Ночевала тучка золотая на груди утеса-великана.
+
+### Fixed
+
+* When used with systemd v240+, systemd cgroup drivers no longer skip
+  `DeviceAllow` rules if the device does not exist (a regression introduced
+  in runc 1.1.3). This fix also reverts the workaround added in runc 1.1.5,
+  removing an extra warning emitted by runc run/start. (#3845, #3708, #3671)
+
+### Added
+
+* The source code now has a new file, `runc.keyring`, which contains the keys
+  used to sign runc releases. (#3838)
+
+## [1.1.6] - 2023-04-11
+
+> In this world nothing is certain but death and taxes.
+
+### Compatibility
+
+* This release can no longer be built from sources using Go 1.16. Using a
+  latest maintained Go 1.20.x or Go 1.19.x release is recommended.
+  Go 1.17 can still be used.
+
+### Fixed
+
+* systemd cgroup v1 and v2 drivers were deliberately ignoring `UnitExist` error
+  from systemd while trying to create a systemd unit, which in some scenarios
+  may result in a container not being added to the proper systemd unit and
+  cgroup. (#3780, #3806)
+* systemd cgroup v2 driver was incorrectly translating cpuset range from spec's
+  `resources.cpu.cpus` to systemd unit property (`AllowedCPUs`) in case of more
+  than 8 CPUs, resulting in the wrong AllowedCPUs setting. (#3808)
+* systemd cgroup v1 driver was prefixing container's cgroup path with the path
+  of PID 1 cgroup, resulting in inability to place PID 1 in a non-root cgroup.
+  (#3811)
+* runc run/start may return "permission denied" error when starting a rootless
+  container when the file to be executed does not have executable bit set for
+  the user, not taking the `CAP_DAC_OVERRIDE` capability into account. This is
+  a regression in runc 1.1.4, as well as in Go 1.20 and 1.20.1 (#3715, #3817)
+* cgroup v1 drivers are now aware of `misc` controller. (#3823)
+* Various CI fixes and improvements, mostly to ensure Go 1.19.x and Go 1.20.x
+  compatibility.
+
+## [1.1.5] - 2023-03-29
+
+> 囚われた屈辱は
+> 反撃の嚆矢だ
+
+### Security
+
+The following CVEs were fixed in this release:
+
+* [CVE-2023-25809][] is a vulnerability involving rootless containers where
+  (under specific configurations), the container would have write access to the
+  `/sys/fs/cgroup/user.slice/...` cgroup hierarchy. No other hierarchies on the
+  host were affected. This vulnerability was discovered by Akihiro Suda.
+
+* [CVE-2023-27561][] was a regression in our protections against tricky `/proc`
+  and `/sys` configurations (where the container mountpoint is a symlink)
+  causing us to be tricked into incorrectly configuring the container, which
+  effectively re-introduced [CVE-2019-19921][]. This regression was present
+  from v1.0.0-rc95 to v1.1.4 and was discovered by @Beuc. (#3785)
+
+* [CVE-2023-28642][] is a different attack vector using the same regression
+  as in [CVE-2023-27561][]. This was reported by Lei Wang.
+
+[CVE-2019-19921]: https://github.com/advisories/GHSA-fh74-hm69-rqjw
+[CVE-2023-25809]: https://github.com/opencontainers/runc/security/advisories/GHSA-m8cg-xc2p-r3fc
+[CVE-2023-27561]: https://github.com/advisories/GHSA-vpvm-3wq2-2wvm
+[CVE-2023-28642]: https://github.com/opencontainers/runc/security/advisories/GHSA-g2j6-57v7-gm8c
+
+### Fixed
+
+* Fix the inability to use `/dev/null` when inside a container. (#3620)
+* Fix changing the ownership of host's `/dev/null` caused by fd redirection
+  (a regression in 1.1.1). (#3674, #3731)
+* Fix rare runc exec/enter unshare error on older kernels, including
+  CentOS < 7.7. (#3776)
+* nsexec: Check for errors in `write_log()`. (#3721)
+* Various CI fixes and updates. (#3618, #3630, #3640, #3729)
+
+## [1.1.4] - 2022-08-24
+
+> If you look for perfection, you'll never be content.
+
+### Fixed
+
+* Fix mounting via wrong proc fd.
+  When the user and mount namespaces are used, and the bind mount is followed by
+  the cgroup mount in the spec, the cgroup was mounted using the bind mount's
+  mount fd. (#3511)
+* Switch `kill()` in `libcontainer/nsenter` to `sane_kill()`. (#3536)
+* Fix "permission denied" error from `runc run` on `noexec` fs. (#3541)
+* Fix failed exec after `systemctl daemon-reload`.
+  Due to a regression in v1.1.3, the `DeviceAllow=char-pts rwm` rule was no
+  longer added and was causing an error `open /dev/pts/0: operation not permitted: unknown`
+  when systemd was reloaded. (#3554)
+* Various CI fixes. (#3538, #3558, #3562)
 
 ## [1.1.3] - 2022-06-09
 
@@ -319,7 +880,8 @@ implementation (libcontainer) is *not* covered by this policy.
    cgroups at all during `runc update`). (#2994)
 
 <!-- minor releases -->
-[Unreleased]: https://github.com/opencontainers/runc/compare/v1.1.3...HEAD
+[Unreleased]: https://github.com/opencontainers/runc/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/opencontainers/runc/compare/v1.2.0-rc.1...v1.2.0
 [1.1.0]: https://github.com/opencontainers/runc/compare/v1.1.0-rc.1...v1.1.0
 [1.0.0]: https://github.com/opencontainers/runc/releases/tag/v1.0.0
 
@@ -330,8 +892,26 @@ implementation (libcontainer) is *not* covered by this policy.
 [1.0.1]: https://github.com/opencontainers/runc/compare/v1.0.0...v1.0.1
 
 <!-- 1.1.z patch releases -->
-[Unreleased 1.1.z]: https://github.com/opencontainers/runc/compare/v1.1.3...release-1.1
+[Unreleased 1.1.z]: https://github.com/opencontainers/runc/compare/v1.1.15...release-1.1
+[1.1.15]: https://github.com/opencontainers/runc/compare/v1.1.14...v1.1.15
+[1.1.14]: https://github.com/opencontainers/runc/compare/v1.1.13...v1.1.14
+[1.1.13]: https://github.com/opencontainers/runc/compare/v1.1.12...v1.1.13
+[1.1.12]: https://github.com/opencontainers/runc/compare/v1.1.11...v1.1.12
+[1.1.11]: https://github.com/opencontainers/runc/compare/v1.1.10...v1.1.11
+[1.1.10]: https://github.com/opencontainers/runc/compare/v1.1.9...v1.1.10
+[1.1.9]: https://github.com/opencontainers/runc/compare/v1.1.8...v1.1.9
+[1.1.8]: https://github.com/opencontainers/runc/compare/v1.1.7...v1.1.8
+[1.1.7]: https://github.com/opencontainers/runc/compare/v1.1.6...v1.1.7
+[1.1.6]: https://github.com/opencontainers/runc/compare/v1.1.5...v1.1.6
+[1.1.5]: https://github.com/opencontainers/runc/compare/v1.1.4...v1.1.5
+[1.1.4]: https://github.com/opencontainers/runc/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/opencontainers/runc/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/opencontainers/runc/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/opencontainers/runc/compare/v1.1.0...v1.1.1
 [1.1.0-rc.1]: https://github.com/opencontainers/runc/compare/v1.0.0...v1.1.0-rc.1
+
+<!-- 1.2.z patch releases -->
+[Unreleased 1.2.z]: https://github.com/opencontainers/runc/compare/v1.2.0...release-1.2
+[1.2.0-rc.3]: https://github.com/opencontainers/runc/compare/v1.2.0-rc.2...v1.2.0-rc.3
+[1.2.0-rc.2]: https://github.com/opencontainers/runc/compare/v1.2.0-rc.1...v1.2.0-rc.2
+[1.2.0-rc.1]: https://github.com/opencontainers/runc/compare/v1.1.0...v1.2.0-rc.1

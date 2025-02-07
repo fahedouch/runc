@@ -22,32 +22,27 @@ type Handle struct {
 	needsKernelBase bool
 }
 
-// NewHandle loads BTF into the kernel.
+// NewHandle loads the contents of a [Builder] into the kernel.
 //
-// Returns ErrNotSupported if BTF is not supported.
-func NewHandle(spec *Spec) (*Handle, error) {
-	if spec.byteOrder != nil && spec.byteOrder != internal.NativeEndian {
-		return nil, fmt.Errorf("can't load %s BTF on %s", spec.byteOrder, internal.NativeEndian)
-	}
+// Returns an error wrapping ErrNotSupported if the kernel doesn't support BTF.
+func NewHandle(b *Builder) (*Handle, error) {
+	small := getByteSlice()
+	defer putByteSlice(small)
 
-	enc := newEncoder(kernelEncoderOptions, newStringTableBuilderFromTable(spec.strings))
-
-	for _, typ := range spec.types {
-		_, err := enc.Add(typ)
-		if err != nil {
-			return nil, fmt.Errorf("add %s: %w", typ, err)
-		}
-	}
-
-	btf, err := enc.Encode()
+	buf, err := b.Marshal(*small, KernelMarshalOptions())
 	if err != nil {
 		return nil, fmt.Errorf("marshal BTF: %w", err)
 	}
 
-	return newHandleFromRawBTF(btf)
+	return NewHandleFromRawBTF(buf)
 }
 
-func newHandleFromRawBTF(btf []byte) (*Handle, error) {
+// NewHandleFromRawBTF loads raw BTF into the kernel.
+//
+// Returns an error wrapping ErrNotSupported if the kernel doesn't support BTF.
+func NewHandleFromRawBTF(btf []byte) (*Handle, error) {
+	const minLogSize = 64 * 1024
+
 	if uint64(len(btf)) > math.MaxUint32 {
 		return nil, errors.New("BTF exceeds the maximum size")
 	}
@@ -57,26 +52,54 @@ func newHandleFromRawBTF(btf []byte) (*Handle, error) {
 		BtfSize: uint32(len(btf)),
 	}
 
-	fd, err := sys.BtfLoad(attr)
-	if err == nil {
-		return &Handle{fd, attr.BtfSize, false}, nil
+	var (
+		logBuf []byte
+		err    error
+	)
+	for {
+		var fd *sys.FD
+		fd, err = sys.BtfLoad(attr)
+		if err == nil {
+			return &Handle{fd, attr.BtfSize, false}, nil
+		}
+
+		if attr.BtfLogTrueSize != 0 && attr.BtfLogSize >= attr.BtfLogTrueSize {
+			// The log buffer already has the correct size.
+			break
+		}
+
+		if attr.BtfLogSize != 0 && !errors.Is(err, unix.ENOSPC) {
+			// Up until at least kernel 6.0, the BTF verifier does not return ENOSPC
+			// if there are other verification errors. ENOSPC is only returned when
+			// the BTF blob is correct, a log was requested, and the provided buffer
+			// is too small. We're therefore not sure whether we got the full
+			// log or not.
+			break
+		}
+
+		// Make an educated guess how large the buffer should be. Start
+		// at a reasonable minimum and then double the size.
+		logSize := uint32(max(len(logBuf)*2, minLogSize))
+		if int(logSize) < len(logBuf) {
+			return nil, errors.New("overflow while probing log buffer size")
+		}
+
+		if attr.BtfLogTrueSize != 0 {
+			// The kernel has given us a hint how large the log buffer has to be.
+			logSize = attr.BtfLogTrueSize
+		}
+
+		logBuf = make([]byte, logSize)
+		attr.BtfLogSize = logSize
+		attr.BtfLogBuf = sys.NewSlicePointer(logBuf)
+		attr.BtfLogLevel = 1
 	}
 
 	if err := haveBTF(); err != nil {
 		return nil, err
 	}
 
-	logBuf := make([]byte, 64*1024)
-	attr.BtfLogBuf = sys.NewSlicePointer(logBuf)
-	attr.BtfLogSize = uint32(len(logBuf))
-	attr.BtfLogLevel = 1
-
-	// Up until at least kernel 6.0, the BTF verifier does not return ENOSPC
-	// if there are other verification errors. ENOSPC is only returned when
-	// the BTF blob is correct, a log was requested, and the provided buffer
-	// is too small.
-	_, ve := sys.BtfLoad(attr)
-	return nil, internal.ErrorWithLog("load btf", err, logBuf, errors.Is(ve, unix.ENOSPC))
+	return nil, internal.ErrorWithLog("load btf", err, logBuf)
 }
 
 // NewHandleFromID returns the BTF handle for a given id.
@@ -104,7 +127,10 @@ func NewHandleFromID(id ID) (*Handle, error) {
 }
 
 // Spec parses the kernel BTF into Go types.
-func (h *Handle) Spec() (*Spec, error) {
+//
+// base must contain type information for vmlinux if the handle is for
+// a kernel module. It may be nil otherwise.
+func (h *Handle) Spec(base *Spec) (*Spec, error) {
 	var btfInfo sys.BtfInfo
 	btfBuffer := make([]byte, h.size)
 	btfInfo.Btf, btfInfo.BtfSize = sys.NewSlicePointerLen(btfBuffer)
@@ -113,20 +139,11 @@ func (h *Handle) Spec() (*Spec, error) {
 		return nil, err
 	}
 
-	if !h.needsKernelBase {
-		return loadRawSpec(bytes.NewReader(btfBuffer), internal.NativeEndian, nil, nil)
+	if h.needsKernelBase && base == nil {
+		return nil, fmt.Errorf("missing base types")
 	}
 
-	base, fallback, err := kernelSpec()
-	if err != nil {
-		return nil, fmt.Errorf("load BTF base: %w", err)
-	}
-
-	if fallback {
-		return nil, fmt.Errorf("can't load split BTF without access to /sys")
-	}
-
-	return loadRawSpec(bytes.NewReader(btfBuffer), internal.NativeEndian, base.types, base.strings)
+	return loadRawSpec(bytes.NewReader(btfBuffer), internal.NativeEndian, base)
 }
 
 // Close destroys the handle.
@@ -200,7 +217,7 @@ func newHandleInfoFromFD(fd *sys.FD) (*HandleInfo, error) {
 	}, nil
 }
 
-// IsModule returns true if the BTF is for the kernel itself.
+// IsVmlinux returns true if the BTF is for the kernel itself.
 func (i *HandleInfo) IsVmlinux() bool {
 	return i.IsKernel && i.Name == "vmlinux"
 }

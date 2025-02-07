@@ -83,8 +83,9 @@ function scmp_act_notify_template() {
 }
 
 # Test important syscalls (some might be executed by runc) work fine when handled by the agent. noNewPrivileges FALSE.
+# fcntl: https://github.com/opencontainers/runc/issues/4328
 @test "runc run [seccomp] (SCMP_ACT_NOTIFY important syscalls noNewPrivileges false)" {
-	scmp_act_notify_template "/bin/true" false '"execve","openat","open","read","close"'
+	scmp_act_notify_template "/bin/true" false '"execve","openat","open","read","close","fcntl"'
 
 	runc run test_busybox
 	[ "$status" -eq 0 ]
@@ -92,7 +93,7 @@ function scmp_act_notify_template() {
 
 # Test important syscalls (some might be executed by runc) work fine when handled by the agent. noNewPrivileges TRUE.
 @test "runc run [seccomp] (SCMP_ACT_NOTIFY important syscalls noNewPrivileges true)" {
-	scmp_act_notify_template "/bin/true" true '"execve","openat","open","read","close"'
+	scmp_act_notify_template "/bin/true" true '"execve","openat","open","read","close","fcntl"'
 
 	runc run test_busybox
 	[ "$status" -eq 0 ]
@@ -213,7 +214,7 @@ function scmp_act_notify_template() {
 @test "runc run [seccomp] (SCMP_ACT_NOTIFY example config)" {
 	# Run the script used in the seccomp agent example.
 	# This takes a bare config.json and modifies it to run an example.
-	"${INTEGRATION_ROOT}/../../contrib/cmd/seccompagent/gen-seccomp-example-cfg.sh"
+	"${INTEGRATION_ROOT}/../../tests/cmd/seccompagent/gen-seccomp-example-cfg.sh"
 
 	# The listenerPath the previous command uses is the default used by the
 	# seccomp agent. However, inside bats the socket is in a bats tmp dir.

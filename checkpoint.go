@@ -8,13 +8,13 @@ import (
 	"path/filepath"
 	"strconv"
 
-	criu "github.com/checkpoint-restore/go-criu/v6/rpc"
-	"github.com/opencontainers/runc/libcontainer"
-	"github.com/opencontainers/runc/libcontainer/userns"
+	"github.com/moby/sys/userns"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"golang.org/x/sys/unix"
+
+	"github.com/opencontainers/runc/libcontainer"
 )
 
 var checkpointCommand = cli.Command{
@@ -70,7 +70,9 @@ checkpointed.`,
 		err = container.Checkpoint(options)
 		if err == nil && !(options.LeaveRunning || options.PreDump) {
 			// Destroy the container unless we tell CRIU to keep it.
-			destroy(container)
+			if err := container.Destroy(); err != nil {
+				logrus.Warn(err)
+			}
 		}
 		return err
 	},
@@ -129,6 +131,7 @@ func criuOptions(context *cli.Context) (*libcontainer.CriuOpts, error) {
 		StatusFd:                context.Int("status-fd"),
 		LsmProfile:              context.String("lsm-profile"),
 		LsmMountContext:         context.String("lsm-mount-context"),
+		ManageCgroupsMode:       context.String("manage-cgroups-mode"),
 	}
 
 	// CRIU options below may or may not be set.
@@ -147,21 +150,6 @@ func criuOptions(context *cli.Context) (*libcontainer.CriuOpts, error) {
 			Address: address,
 			Port:    int32(portInt),
 		}
-	}
-
-	switch context.String("manage-cgroups-mode") {
-	case "":
-		// do nothing
-	case "soft":
-		opts.ManageCgroupsMode = criu.CriuCgMode_SOFT
-	case "full":
-		opts.ManageCgroupsMode = criu.CriuCgMode_FULL
-	case "strict":
-		opts.ManageCgroupsMode = criu.CriuCgMode_STRICT
-	case "ignore":
-		opts.ManageCgroupsMode = criu.CriuCgMode_IGNORE
-	default:
-		return nil, errors.New("Invalid manage-cgroups-mode value")
 	}
 
 	// runc doesn't manage network devices and their configuration.

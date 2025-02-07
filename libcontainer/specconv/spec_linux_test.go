@@ -6,9 +6,9 @@ import (
 	"testing"
 
 	dbus "github.com/godbus/dbus/v5"
+	devices "github.com/opencontainers/runc/libcontainer/cgroups/devices/config"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/configs/validate"
-	"github.com/opencontainers/runc/libcontainer/devices"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 )
@@ -605,6 +605,40 @@ func TestDupNamespaces(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "malformed spec file: duplicated ns") {
 		t.Errorf("Duplicated namespaces should be forbidden")
+	}
+}
+
+func TestUserNamespaceMappingAndPath(t *testing.T) {
+	if _, err := os.Stat("/proc/self/ns/user"); os.IsNotExist(err) {
+		t.Skip("Test requires userns.")
+	}
+
+	spec := &specs.Spec{
+		Root: &specs.Root{
+			Path: "rootfs",
+		},
+		Linux: &specs.Linux{
+			UIDMappings: []specs.LinuxIDMapping{
+				{ContainerID: 0, HostID: 1000, Size: 1000},
+			},
+			GIDMappings: []specs.LinuxIDMapping{
+				{ContainerID: 0, HostID: 2000, Size: 1000},
+			},
+			Namespaces: []specs.LinuxNamespace{
+				{
+					Type: "user",
+					Path: "/proc/1/ns/user",
+				},
+			},
+		},
+	}
+
+	_, err := CreateLibcontainerConfig(&CreateOpts{
+		Spec: spec,
+	})
+
+	if !strings.Contains(err.Error(), "both namespace path and non-matching mapping specified") {
+		t.Errorf("user namespace with path and non-matching mapping should be forbidden, got error %v", err)
 	}
 }
 
